@@ -504,7 +504,7 @@ func (s *ContinueAsNewTestSuite) TestContinueAsNewWithDelayStart() {
 	s.NoError(err)
 	env.Logger.Info("StartWorkflowExecution", tag.WorkflowRunID(we.RunId))
 
-	const delayStart = 1 * time.Second
+	const delayStart = 2 * time.Second
 
 	continueAsNewed := false
 	workflowComplete := false
@@ -561,13 +561,33 @@ func (s *ContinueAsNewTestSuite) TestContinueAsNewWithDelayStart() {
 
 	newRunExecution := &commonpb.WorkflowExecution{WorkflowId: id, RunId: newRunID}
 
-	// Process the new run's first workflow task. The poller long-polls and blocks until the task
-	// becomes available, which only happens once the delay-start backoff timer fires (~delayStart
-	// later). Long-polling here keeps the test deterministic: we don't have to inspect intermediate
-	// history to observe that the task was deferred.
+	// Signal the continued-as-new run while its first workflow task is still delayed. The signal
+	// must be persisted without bypassing the first-workflow-task backoff.
+	signalResp, err := env.FrontendClient().SignalWithStartWorkflowExecution(s.Context(), &workflowservice.SignalWithStartWorkflowExecutionRequest{
+		RequestId:             uuid.NewString(),
+		Namespace:             env.Namespace().String(),
+		WorkflowId:            id,
+		WorkflowType:          workflowType,
+		TaskQueue:             taskQueue,
+		WorkflowRunTimeout:    durationpb.New(100 * time.Second),
+		WorkflowTaskTimeout:   durationpb.New(10 * time.Second),
+		SignalName:            "signal-during-continue-as-new-backoff",
+		Identity:              identity,
+		WorkflowIdReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+	})
+	s.Require().NoError(err)
+	s.Require().False(signalResp.Started)
+	s.Require().Equal(newRunID, signalResp.RunId)
+
+	preDelayEvents := env.GetHistory(env.Namespace().String(), newRunExecution)
+	s.Require().Len(preDelayEvents, 2)
+	s.Require().Equal(enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, preDelayEvents[0].GetEventType())
+	s.Require().Equal(enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED, preDelayEvents[1].GetEventType())
+
+	// Process the new run's first workflow task after the delay-start backoff timer fires.
 	_, err = poller.PollAndHandleWorkflowTask(tv, wtHandler)
-	s.NoError(err)
-	s.True(workflowComplete)
+	s.Require().NoError(err)
+	s.Require().True(workflowComplete)
 
 	// The new run started with the requested first-workflow-task backoff and ran to completion.
 	finalEvents := env.GetHistory(env.Namespace().String(), newRunExecution)
@@ -576,15 +596,16 @@ func (s *ContinueAsNewTestSuite) TestContinueAsNewWithDelayStart() {
 	s.Equal(we.RunId, startedAttrs.GetContinuedExecutionRunId())
 	s.EqualHistoryEvents(`
   1 WorkflowExecutionStarted
-  2 WorkflowTaskScheduled
-  3 WorkflowTaskStarted
-  4 WorkflowTaskCompleted
-  5 WorkflowExecutionCompleted`, finalEvents)
+  2 WorkflowExecutionSignaled
+  3 WorkflowTaskScheduled
+  4 WorkflowTaskStarted
+  5 WorkflowTaskCompleted
+  6 WorkflowExecutionCompleted`, finalEvents)
 
 	// The first workflow task of the new run was scheduled only after the delay-start backoff: its
 	// scheduled-event timestamp is delayStart after the run's start event.
 	startedTime := finalEvents[0].GetEventTime().AsTime()
-	scheduledTime := finalEvents[1].GetEventTime().AsTime()
+	scheduledTime := finalEvents[2].GetEventTime().AsTime()
 	s.GreaterOrEqual(scheduledTime.Sub(startedTime), delayStart)
 }
 

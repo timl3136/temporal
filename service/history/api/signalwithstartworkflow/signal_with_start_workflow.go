@@ -358,16 +358,16 @@ func signalWorkflow(
 
 			workflowKey := workflowLease.GetContext().GetWorkflowKey()
 			shardContext.GetThrottledLogger().Info(
-				"Skipped workflow start delay for signalWithStart request",
+				"Prevented SignalWithStart request from skipping workflow start delay",
 				tag.WorkflowNamespace(request.GetNamespace()),
 				tag.WorkflowID(workflowKey.WorkflowID),
 				tag.WorkflowRunID(workflowKey.RunID),
 			)
-		}
-
-		_, err := mutableState.AddWorkflowTaskScheduledEvent(false, enumsspb.WORKFLOW_TASK_TYPE_NORMAL)
-		if err != nil {
-			return err
+		} else {
+			_, err := mutableState.AddWorkflowTaskScheduledEvent(false, enumsspb.WORKFLOW_TASK_TYPE_NORMAL)
+			if err != nil {
+				return err
+			}
 		}
 	}
 

@@ -176,18 +176,18 @@ func (s *signalWithStartWorkflowSuite) TestSignalWorkflow_NewWorkflowTask() {
 }
 
 func (s *signalWithStartWorkflowSuite) TestSignalWorkflow_WorkflowTaskAtExecutionTime() {
-	s.assertWorkflowTaskScheduledAtExecutionTime(s.timeSource.Now(), false)
+	s.assertSignalWorkflowBehaviorAtExecutionTime(s.timeSource.Now(), true, false)
 }
 
 func (s *signalWithStartWorkflowSuite) TestSignalWorkflow_WorkflowTaskAfterExecutionTime() {
-	s.assertWorkflowTaskScheduledAtExecutionTime(s.timeSource.Now().Add(-time.Second), false)
+	s.assertSignalWorkflowBehaviorAtExecutionTime(s.timeSource.Now().Add(-time.Second), true, false)
 }
 
 func (s *signalWithStartWorkflowSuite) TestSignalWorkflow_WorkflowTaskBeforeExecutionTime() {
-	s.assertWorkflowTaskScheduledAtExecutionTime(s.timeSource.Now().Add(time.Hour), true)
+	s.assertSignalWorkflowBehaviorAtExecutionTime(s.timeSource.Now().Add(time.Hour), false, true)
 }
 
-func (s *signalWithStartWorkflowSuite) assertWorkflowTaskScheduledAtExecutionTime(executionTime time.Time, expectMetric bool) {
+func (s *signalWithStartWorkflowSuite) assertSignalWorkflowBehaviorAtExecutionTime(executionTime time.Time, expectSchedule bool, expectMetric bool) {
 	s.currentExecutionInfo.ExecutionTime = timestamppb.New(executionTime)
 	capture := s.metricsHandler.StartCapture()
 	defer s.metricsHandler.StopCapture(capture)
@@ -213,7 +213,9 @@ func (s *signalWithStartWorkflowSuite) assertWorkflowTaskScheduledAtExecutionTim
 	).Return(&historypb.HistoryEvent{}, nil)
 	s.currentMutableState.EXPECT().HasPendingWorkflowTask().Return(false)
 	s.currentMutableState.EXPECT().IsWorkflowExecutionStatusPaused().Return(false)
-	s.currentMutableState.EXPECT().AddWorkflowTaskScheduledEvent(false, enumsspb.WORKFLOW_TASK_TYPE_NORMAL).Return(&historyi.WorkflowTaskInfo{}, nil)
+	if expectSchedule {
+		s.currentMutableState.EXPECT().AddWorkflowTaskScheduledEvent(false, enumsspb.WORKFLOW_TASK_TYPE_NORMAL).Return(&historyi.WorkflowTaskInfo{}, nil)
+	}
 	s.currentContext.EXPECT().UpdateWorkflowExecutionAsActive(ctx, s.shardContext).Return(nil)
 
 	err := signalWorkflow(
@@ -226,9 +228,9 @@ func (s *signalWithStartWorkflowSuite) assertWorkflowTaskScheduledAtExecutionTim
 	recordings := capture.Snapshot()[metrics.SignalWithStartSkipDelayCounter.Name()]
 	if expectMetric {
 		s.Require().Len(recordings, 1)
-		s.Equal(request.GetNamespace(), recordings[0].Tags[metrics.NamespaceTag(request.GetNamespace()).Key])
+		s.Require().Equal(request.GetNamespace(), recordings[0].Tags[metrics.NamespaceTag(request.GetNamespace()).Key])
 	} else {
-		s.Empty(recordings)
+		s.Require().Empty(recordings)
 	}
 }
 
