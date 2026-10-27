@@ -339,6 +339,14 @@ func (c *temporalImpl) WorkerGRPCAddress() string {
 	return c.hostsByProtocolByService[grpcProtocol][primitives.WorkerService].All[0]
 }
 
+func (c *temporalImpl) HistoryGRPCAddress() string {
+	return c.hostsByProtocolByService[grpcProtocol][primitives.HistoryService].All[0]
+}
+
+func (c *temporalImpl) MatchingGRPCAddress() string {
+	return c.hostsByProtocolByService[grpcProtocol][primitives.MatchingService].All[0]
+}
+
 func (c *temporalImpl) DcClient() *dynamicconfig.MemoryClient {
 	return c.dcClient
 }

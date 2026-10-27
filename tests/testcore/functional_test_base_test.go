@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/suite"
+	"go.temporal.io/server/common/health"
 	"go.temporal.io/server/service/worker"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -31,6 +32,28 @@ func (s *FunctionalTestBaseSuite) TearDownSuite() {
 
 func (s *FunctionalTestBaseSuite) SetupTest() {
 	s.functionalTestBase.SetupTest()
+}
+
+// A peer can call grpc.health.v1 on history and matching over the same port as their API.
+func (s *FunctionalTestBaseSuite) TestHistoryAndMatchingHealthPing() {
+	for _, tc := range []struct{ addr, service string }{
+		{s.GetTestCluster().HistoryGRPCAddress(), "temporal.api.workflowservice.v1.HistoryService"},
+		{s.GetTestCluster().MatchingGRPCAddress(), "temporal.api.workflowservice.v1.MatchingService"},
+	} {
+		conn, err := grpc.NewClient(tc.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		s.NoError(err, tc.service)
+		s.NoError(health.PingGRPCHealth(context.Background(), conn, "", time.Second), tc.service)
+		s.Eventually(
+			func() bool {
+				resp, err := healthpb.NewHealthClient(conn).Check(context.Background(), &healthpb.HealthCheckRequest{Service: tc.service})
+				return err == nil && resp.Status == healthpb.HealthCheckResponse_SERVING
+			},
+			20*time.Second,
+			100*time.Millisecond,
+			tc.service,
+		)
+		_ = conn.Close()
+	}
 }
 
 func (s *FunctionalTestBaseSuite) TestWorkerServiceHealthCheck() {

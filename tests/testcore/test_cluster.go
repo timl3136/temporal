@@ -444,6 +444,14 @@ func (tc *TestCluster) WorkerGRPCAddress() string {
 	return tc.host.WorkerGRPCAddress()
 }
 
+func (tc *TestCluster) HistoryGRPCAddress() string {
+	return tc.host.HistoryGRPCAddress()
+}
+
+func (tc *TestCluster) MatchingGRPCAddress() string {
+	return tc.host.MatchingGRPCAddress()
+}
+
 func (tc *TestCluster) ClusterName() string {
 	return tc.host.serverConfig.ClusterMetadata.CurrentClusterName
 }
