@@ -676,6 +676,20 @@ func TestStartNexusOperationWorkflowResultFailureMatchesCallback(t *testing.T) {
 			))
 			require.NoError(t, err)
 			protorequire.ProtoEqual(t, callbackFailure, resp.GetResponse().GetFailure())
+
+			// Every other operation keeps the baseline conversion.
+			resp, err = startWorkflowServiceNexusOperation(t, nexus.NewSyncOperation(
+				"SomeOtherOperation",
+				func(context.Context, string, nexus.StartOperationOptions) (*commonpb.Payload, error) {
+					return nil, opErr
+				},
+			))
+			require.NoError(t, err)
+			baselineNexusFailure, err := nexusrpc.DefaultFailureConverter().ErrorToFailure(opErr)
+			require.NoError(t, err)
+			baselineFailure, err := commonnexus.NexusFailureToTemporalFailure(baselineNexusFailure)
+			require.NoError(t, err)
+			protorequire.ProtoEqual(t, baselineFailure, resp.GetResponse().GetFailure())
 		})
 	}
 }
