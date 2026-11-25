@@ -71,10 +71,6 @@ func WorkflowResultFromCloseEvent(event *historypb.HistoryEvent, limit int) (*co
 	}
 	if proto.Size(cause) > limit {
 		cause = failure.NewServerFailure("workflow result exceeds the size limit", true)
-		if proto.Size(cause) > limit {
-			// Keep the non-retryable flag even if the limit cannot fit the minimal failure.
-			cause.Message = ""
-		}
 	}
 
 	nexusFailure, err := TemporalFailureToNexusFailure(cause)

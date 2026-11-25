@@ -574,6 +574,38 @@ func TestStartNexusOperationWorkflowResult(t *testing.T) {
 	}
 }
 
+func TestStartNexusOperationRawResultOnlyForWorkflowResult(t *testing.T) {
+	t.Parallel()
+
+	// Any other service/operation returning a *commonpb.Payload must keep the system payload checks.
+	for _, tc := range []struct {
+		name      string
+		service   string
+		operation string
+	}{
+		{name: "other workflow service operation", service: workflowservicenexus.TemporalAPIWorkflowserviceV1WorkflowService.ServiceName, operation: "SomeOtherOperation"},
+		{name: "result operation name in another service", service: "TestService", operation: commonnexus.GetWorkflowExecutionResultOperation},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			resp, err := startNexusOperationInService(t, tc.service, nexus.NewSyncOperation(
+				tc.operation,
+				func(context.Context, string, nexus.StartOperationOptions) (*commonpb.Payload, error) {
+					return &commonpb.Payload{
+						Metadata: map[string][]byte{"encoding": []byte("binary/encrypted")},
+						Data:     []byte{0xff, 0x00, 0x80},
+					}, nil
+				},
+			))
+			// The old path re-encodes the value as a protobuf message and stamps the system marker.
+			require.NoError(t, err)
+			got := resp.GetResponse().GetSyncSuccess().GetPayload()
+			require.Equal(t, "binary/protobuf", string(got.GetMetadata()["encoding"]))
+			require.Equal(t, "true", string(got.GetMetadata()[commonnexus.SystemPayloadMetadataKey]))
+		})
+	}
+}
+
 func TestStartNexusOperationWorkflowResultRejectsWrongOutput(t *testing.T) {
 	t.Parallel()
 
@@ -650,8 +682,13 @@ func TestStartNexusOperationWorkflowResultFailureMatchesCallback(t *testing.T) {
 
 func startWorkflowServiceNexusOperation(t *testing.T, operation nexus.RegisterableOperation) (*historyservice.StartNexusOperationResponse, error) {
 	t.Helper()
+	return startNexusOperationInService(t, workflowservicenexus.TemporalAPIWorkflowserviceV1WorkflowService.ServiceName, operation)
+}
 
-	service := nexus.NewService(workflowservicenexus.TemporalAPIWorkflowserviceV1WorkflowService.ServiceName)
+func startNexusOperationInService(t *testing.T, serviceName string, operation nexus.RegisterableOperation) (*historyservice.StartNexusOperationResponse, error) {
+	t.Helper()
+
+	service := nexus.NewService(serviceName)
 	service.MustRegister(operation)
 	registry := nexus.NewServiceRegistry()
 	registry.MustRegister(service)
