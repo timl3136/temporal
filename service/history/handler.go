@@ -17,8 +17,10 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	failurepb "go.temporal.io/api/failure/v1"
 	nexuspb "go.temporal.io/api/nexus/v1"
 	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/api/workflowservice/v1/workflowservicenexus"
 	"go.temporal.io/server/api/historyservice/v1"
 	namespacespb "go.temporal.io/server/api/namespace/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
@@ -2562,7 +2564,10 @@ func (h *Handler) StartNexusOperation(
 	ctx context.Context,
 	req *historyservice.StartNexusOperationRequest,
 ) (*historyservice.StartNexusOperationResponse, error) {
-	requestID := req.GetRequest().GetRequestId()
+	request := req.GetRequest()
+	requestID := request.GetRequestId()
+	workflowResult := request.GetService() == workflowservicenexus.TemporalAPIWorkflowserviceV1WorkflowService.ServiceName &&
+		request.GetOperation() == commonnexus.GetWorkflowExecutionResultOperation
 	// Build nexus.StartOperationOptions from the request
 	options := nexus.StartOperationOptions{
 		// Header not supported for system endpoint operations.
@@ -2590,11 +2595,7 @@ func (h *Handler) StartNexusOperation(
 	result, err := h.nexusHandler.StartOperation(ctx, req.GetRequest().GetService(), req.GetRequest().GetOperation(), input, options)
 	if err != nil {
 		if opErr, ok := errors.AsType[*nexus.OperationError](err); ok {
-			nexusFailure, convErr := nexusrpc.DefaultFailureConverter().ErrorToFailure(opErr)
-			if convErr != nil {
-				return nil, convErr
-			}
-			temporalFailure, convErr := commonnexus.NexusFailureToTemporalFailure(nexusFailure)
+			temporalFailure, convErr := startNexusOperationFailure(opErr, workflowResult)
 			if convErr != nil {
 				return nil, convErr
 			}
@@ -2615,32 +2616,19 @@ func (h *Handler) StartNexusOperation(
 	response := &nexuspb.StartOperationResponse{}
 	switch r := result.(type) {
 	case interface{ ValueAsAny() any }:
-		ps, err := sdkconverter.PreferProtoDataConverter.ToPayloads(r.ValueAsAny())
-		if err != nil {
-			h.logger.Error("failed to encode payload", tag.NexusStageHandlerInbound, tag.Error(err), tag.RequestID(requestID))
-			return nil, serviceerror.NewInternal("internal error (request ID: " + requestID + ")")
-		}
-
 		var payload *commonpb.Payload
-		if len(ps.GetPayloads()) == 1 {
-			payload = ps.GetPayloads()[0]
-		}
-		// Responses from the System Nexus Endpoint are server generated, so we must mark them as system payloads.
-		if payload != nil {
-			if payload.Metadata == nil {
-				payload.Metadata = make(map[string][]byte, 1)
+		if workflowResult {
+			var ok bool
+			payload, ok = r.ValueAsAny().(*commonpb.Payload)
+			if !ok {
+				h.logger.Error("invalid workflow result type", tag.NexusStageHandlerInbound, tag.RequestID(requestID))
+				return nil, serviceerror.NewInternal("internal error (request ID: " + requestID + ")")
 			}
-
-			// For now, we require all responess from the System Nexus Endpoint be protobufs.
-			encoding := string(payload.Metadata["encoding"])
-			if encoding != "binary/protobuf" {
-				return nil, serviceerror.NewFailedPreconditionf("system payload must be encoded as binary/protobuf but got %s", encoding)
+		} else {
+			payload, err = h.encodeSystemNexusResult(r.ValueAsAny(), requestID)
+			if err != nil {
+				return nil, err
 			}
-			if _, ok := payload.Metadata["messageType"]; !ok {
-				return nil, serviceerror.NewFailedPrecondition("system payload missing messageType metadata key")
-			}
-
-			payload.Metadata[commonnexus.SystemPayloadMetadataKey] = []byte("true")
 		}
 
 		response.Variant = &nexuspb.StartOperationResponse_SyncSuccess{
@@ -2665,6 +2653,50 @@ func (h *Handler) StartNexusOperation(
 		Response: response,
 	}, nil
 }
+
+func startNexusOperationFailure(opErr *nexus.OperationError, workflowResult bool) (*failurepb.Failure, error) {
+	if workflowResult {
+		// Use the same failure cause as a result callback.
+		return commonnexus.OperationErrorToTemporalFailure(opErr)
+	}
+	nexusFailure, err := nexusrpc.DefaultFailureConverter().ErrorToFailure(opErr)
+	if err != nil {
+		return nil, err
+	}
+	return commonnexus.NexusFailureToTemporalFailure(nexusFailure)
+}
+
+func (h *Handler) encodeSystemNexusResult(value any, requestID string) (*commonpb.Payload, error) {
+	ps, err := sdkconverter.PreferProtoDataConverter.ToPayloads(value)
+	if err != nil {
+		h.logger.Error("failed to encode payload", tag.NexusStageHandlerInbound, tag.Error(err), tag.RequestID(requestID))
+		return nil, serviceerror.NewInternal("internal error (request ID: " + requestID + ")")
+	}
+
+	var payload *commonpb.Payload
+	if len(ps.GetPayloads()) == 1 {
+		payload = ps.GetPayloads()[0]
+	}
+	// Responses from the System Nexus Endpoint are server generated, so we must mark them as system payloads.
+	if payload != nil {
+		if payload.Metadata == nil {
+			payload.Metadata = make(map[string][]byte, 1)
+		}
+
+		// For now, we require all responses from the System Nexus Endpoint be protobufs.
+		encoding := string(payload.Metadata["encoding"])
+		if encoding != "binary/protobuf" {
+			return nil, serviceerror.NewFailedPreconditionf("system payload must be encoded as binary/protobuf but got %s", encoding)
+		}
+		if _, ok := payload.Metadata["messageType"]; !ok {
+			return nil, serviceerror.NewFailedPrecondition("system payload missing messageType metadata key")
+		}
+
+		payload.Metadata[commonnexus.SystemPayloadMetadataKey] = []byte("true")
+	}
+	return payload, nil
+}
+
 func (h *Handler) CancelNexusOperation(
 	ctx context.Context,
 	req *historyservice.CancelNexusOperationRequest,

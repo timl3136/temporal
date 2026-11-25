@@ -9,9 +9,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	commonpb "go.temporal.io/api/common/v1"
+	failurepb "go.temporal.io/api/failure/v1"
 	nexuspb "go.temporal.io/api/nexus/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
+	"go.temporal.io/api/workflowservice/v1/workflowservicenexus"
 	"go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	tokenspb "go.temporal.io/server/api/token/v1"
@@ -25,12 +27,15 @@ import (
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
 	commonnexus "go.temporal.io/server/common/nexus"
+	"go.temporal.io/server/common/nexus/nexusrpc"
 	"go.temporal.io/server/common/payload"
 	serviceerrors "go.temporal.io/server/common/serviceerror"
+	"go.temporal.io/server/common/testing/protorequire"
 	"go.temporal.io/server/service/history/configs"
 	"go.temporal.io/server/service/history/shard"
 	"go.temporal.io/server/service/history/tests"
 	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestDescribeHistoryHost(t *testing.T) {
@@ -533,4 +538,133 @@ func TestStartNexusOperation_SystemNexusEndpointRejectsNonProtoResponse(t *testi
 	var failedPrecondition *serviceerror.FailedPrecondition
 	require.ErrorAs(t, err, &failedPrecondition)
 	require.ErrorContains(t, err, "system payload must be encoded as binary/protobuf but got json/plain")
+}
+
+func TestStartNexusOperationWorkflowResult(t *testing.T) {
+	t.Parallel()
+
+	stored := &commonpb.Payload{
+		Metadata: map[string][]byte{"encoding": []byte("binary/encrypted"), "codec": {0x80, 0x00, 0xff}},
+		Data:     []byte{0xff, 0x00, 0x80},
+	}
+	for _, tc := range []struct {
+		name    string
+		payload *commonpb.Payload
+	}{
+		{name: "encrypted payload", payload: stored},
+		{name: "absent payload"},
+		{name: "present empty payload", payload: &commonpb.Payload{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			resp, err := startWorkflowServiceNexusOperation(t, nexus.NewSyncOperation(
+				commonnexus.GetWorkflowExecutionResultOperation,
+				func(context.Context, string, nexus.StartOperationOptions) (*commonpb.Payload, error) {
+					return tc.payload, nil
+				},
+			))
+			require.NoError(t, err)
+			data, err := proto.Marshal(resp.GetResponse())
+			require.NoError(t, err)
+			wire := &nexuspb.StartOperationResponse{}
+			require.NoError(t, proto.Unmarshal(data, wire))
+			require.NotNil(t, wire.GetSyncSuccess())
+			require.True(t, proto.Equal(tc.payload, wire.GetSyncSuccess().GetPayload()))
+		})
+	}
+}
+
+func TestStartNexusOperationWorkflowResultRejectsWrongOutput(t *testing.T) {
+	t.Parallel()
+
+	resp, err := startWorkflowServiceNexusOperation(t, nexus.NewSyncOperation(
+		commonnexus.GetWorkflowExecutionResultOperation,
+		func(context.Context, string, nexus.StartOperationOptions) (*workflowservice.SignalWithStartWorkflowExecutionResponse, error) {
+			return &workflowservice.SignalWithStartWorkflowExecutionResponse{Started: true}, nil
+		},
+	))
+	require.ErrorAs(t, err, new(*serviceerror.Internal))
+	require.Nil(t, resp)
+}
+
+func TestStartNexusOperationWorkflowResultFailureMatchesCallback(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		state nexus.OperationState
+		cause *failurepb.Failure
+	}{
+		{
+			name:  "failed",
+			state: nexus.OperationStateFailed,
+			cause: &failurepb.Failure{
+				Message: "workflow failed",
+				FailureInfo: &failurepb.Failure_ApplicationFailureInfo{
+					ApplicationFailureInfo: &failurepb.ApplicationFailureInfo{Type: "Example"},
+				},
+				EncodedAttributes: &commonpb.Payload{
+					Metadata: map[string][]byte{"encoding": []byte("binary/encrypted")},
+					Data:     []byte{0xff, 0x00, 0x80},
+				},
+				Cause: &failurepb.Failure{Message: "nested cause"},
+			},
+		},
+		{
+			name:  "canceled",
+			state: nexus.OperationStateCanceled,
+			cause: &failurepb.Failure{
+				Message: "workflow canceled",
+				FailureInfo: &failurepb.Failure_CanceledFailureInfo{
+					CanceledFailureInfo: &failurepb.CanceledFailureInfo{
+						Details: &commonpb.Payloads{Payloads: []*commonpb.Payload{payload.EncodeString("details")}},
+					},
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			nexusFailure, err := commonnexus.TemporalFailureToNexusFailure(tc.cause)
+			require.NoError(t, err)
+			opErr := &nexus.OperationError{
+				State: tc.state,
+				Cause: &nexus.FailureError{Failure: nexusFailure},
+			}
+			require.NoError(t, nexusrpc.MarkAsWrapperError(nexusrpc.DefaultFailureConverter(), opErr))
+			callbackFailure, err := commonnexus.OperationErrorToTemporalFailure(opErr)
+			require.NoError(t, err)
+			protorequire.ProtoEqual(t, tc.cause, callbackFailure)
+
+			resp, err := startWorkflowServiceNexusOperation(t, nexus.NewSyncOperation(
+				commonnexus.GetWorkflowExecutionResultOperation,
+				func(context.Context, string, nexus.StartOperationOptions) (*commonpb.Payload, error) {
+					return nil, opErr
+				},
+			))
+			require.NoError(t, err)
+			protorequire.ProtoEqual(t, callbackFailure, resp.GetResponse().GetFailure())
+		})
+	}
+}
+
+func startWorkflowServiceNexusOperation(t *testing.T, operation nexus.RegisterableOperation) (*historyservice.StartNexusOperationResponse, error) {
+	t.Helper()
+
+	service := nexus.NewService(workflowservicenexus.TemporalAPIWorkflowserviceV1WorkflowService.ServiceName)
+	service.MustRegister(operation)
+	registry := nexus.NewServiceRegistry()
+	registry.MustRegister(service)
+	nexusHandler, err := registry.NewHandler()
+	require.NoError(t, err)
+
+	h := Handler{logger: log.NewNoopLogger(), nexusHandler: nexusHandler}
+	return h.StartNexusOperation(t.Context(), &historyservice.StartNexusOperationRequest{
+		Request: &nexuspb.StartOperationRequest{
+			Service:   service.Name,
+			Operation: operation.Name(),
+			RequestId: "test-request-id",
+			Payload:   payload.EncodeString("Temporal"),
+		},
+	})
 }
