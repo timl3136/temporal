@@ -361,6 +361,7 @@ type startArgs struct {
 	service                  string
 	operation                string
 	requestID                string
+	callerInfo               *historyservice.NexusCallerInfo
 	endpointName             string
 	endpointID               string
 	scheduledTime            time.Time
@@ -421,6 +422,14 @@ func (e taskExecutor) loadOperationArgs(
 		args.namespaceFailoverVersion = event.Version
 		return nil
 	})
+	if err == nil {
+		args.callerInfo = &historyservice.NexusCallerInfo{
+			NamespaceId: ref.WorkflowKey.NamespaceID,
+			WorkflowId:  ref.WorkflowKey.WorkflowID,
+			RunId:       ref.WorkflowKey.RunID,
+			RequestId:   args.requestID,
+		}
+	}
 	return
 }
 
@@ -875,6 +884,7 @@ func (e taskExecutor) executeCancelationTask(ctx context.Context, env hsm.Enviro
 
 type cancelArgs struct {
 	service, operation, token, endpointID, endpointName, requestID string
+	callerInfo                                                     *historyservice.NexusCallerInfo
 	scheduledTime                                                  time.Time
 	startedTime                                                    time.Time
 	workflowTimeSnapshot                                           time.Time
@@ -926,6 +936,14 @@ func (e taskExecutor) loadArgsForCancelation(ctx context.Context, env hsm.Enviro
 		}
 		return nil
 	})
+	if err == nil {
+		args.callerInfo = &historyservice.NexusCallerInfo{
+			NamespaceId: ref.WorkflowKey.NamespaceID,
+			WorkflowId:  ref.WorkflowKey.WorkflowID,
+			RunId:       ref.WorkflowKey.RunID,
+			RequestId:   args.requestID,
+		}
+	}
 	return
 }
 
@@ -1231,6 +1249,7 @@ func (e taskExecutor) startOnHistoryService(
 	res, err := e.ChasmRegistry.NexusEndpointProcessor.ProcessInput(chasm.NexusOperationProcessorContext{
 		Namespace: ns,
 		RequestID: args.requestID,
+		Caller:    args.callerInfo,
 		Links:     []nexus.Link{args.nexusLink},
 		// Indicate that the input payload can be overwritten with defaults populated.
 		ReserializeInputPayload: true,
@@ -1241,6 +1260,7 @@ func (e taskExecutor) startOnHistoryService(
 	resp, err := e.HistoryClient.StartNexusOperation(ctx, &historyservice.StartNexusOperationRequest{
 		NamespaceId: ns.ID().String(),
 		ShardId:     res.RoutingKey.ShardID(e.Config.NumHistoryShards),
+		CallerInfo:  args.callerInfo,
 		// NOTE: Header is not allowed for system operations.
 		Request: &nexuspb.StartOperationRequest{
 			Service:        args.service,
@@ -1305,6 +1325,7 @@ func (e taskExecutor) cancelOnHistoryService(
 	res, err := e.ChasmRegistry.NexusEndpointProcessor.ProcessInput(chasm.NexusOperationProcessorContext{
 		Namespace: ns,
 		RequestID: args.requestID,
+		Caller:    args.callerInfo,
 		// Links are not needed for cancelation.
 	}, args.service, args.operation, args.payload)
 	if err != nil {
@@ -1314,6 +1335,7 @@ func (e taskExecutor) cancelOnHistoryService(
 	_, err = e.HistoryClient.CancelNexusOperation(ctx, &historyservice.CancelNexusOperationRequest{
 		NamespaceId: ns.ID().String(),
 		ShardId:     res.RoutingKey.ShardID(e.Config.NumHistoryShards),
+		CallerInfo:  args.callerInfo,
 		Request: &nexuspb.CancelOperationRequest{
 			Service:        args.service,
 			Operation:      args.operation,

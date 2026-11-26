@@ -76,6 +76,7 @@ var (
 		"StartWorkflowExecution":                       {Scope: ScopeNamespace, Access: AccessWrite, Polling: PollingNone},
 		"GetWorkflowExecutionHistory":                  {Scope: ScopeNamespace, Access: AccessReadOnly, Polling: PollingCapable},
 		"GetWorkflowExecutionHistoryReverse":           {Scope: ScopeNamespace, Access: AccessReadOnly, Polling: PollingNone},
+		"GetWorkflowExecutionResult":                   {Scope: ScopeCluster, Access: AccessReadOnly, Polling: PollingNone},
 		"PollWorkflowTaskQueue":                        {Scope: ScopeNamespace, Access: AccessWrite, Polling: PollingAlways},
 		"RespondWorkflowTaskCompleted":                 {Scope: ScopeNamespace, Access: AccessWrite, Polling: PollingNone},
 		"RespondWorkflowTaskFailed":                    {Scope: ScopeNamespace, Access: AccessWrite, Polling: PollingNone},

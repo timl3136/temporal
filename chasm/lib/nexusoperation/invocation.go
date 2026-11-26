@@ -27,6 +27,7 @@ type startArgs struct {
 	service                string
 	operation              string
 	requestID              string
+	callerInfo             *historyservice.NexusCallerInfo
 	endpointName           string
 	endpointID             string
 	currentTime            time.Time
@@ -227,6 +228,7 @@ func (i *invocationSystem) Start(
 	res, err := i.chasmRegistry.NexusEndpointProcessor.ProcessInput(chasm.NexusOperationProcessorContext{
 		Namespace:               i.ns,
 		RequestID:               args.requestID,
+		Caller:                  args.callerInfo,
 		Links:                   args.nexusLinks,
 		ReserializeInputPayload: true,
 	}, args.service, args.operation, args.payload)
@@ -236,6 +238,7 @@ func (i *invocationSystem) Start(
 	resp, err := i.historyClient.StartNexusOperation(ctx, &historyservice.StartNexusOperationRequest{
 		NamespaceId: i.ns.ID().String(),
 		ShardId:     res.RoutingKey.ShardID(i.config.NumHistoryShards),
+		CallerInfo:  args.callerInfo,
 		Request: &nexuspb.StartOperationRequest{
 			Service:        args.service,
 			Operation:      args.operation,
@@ -296,6 +299,7 @@ func (i *invocationSystem) Cancel(
 	res, err := i.chasmRegistry.NexusEndpointProcessor.ProcessInput(chasm.NexusOperationProcessorContext{
 		Namespace: i.ns,
 		RequestID: args.requestID,
+		Caller:    args.callerInfo,
 		// Links are not needed for cancellation.
 	}, args.service, args.operation, args.payload)
 	if err != nil {
@@ -305,6 +309,7 @@ func (i *invocationSystem) Cancel(
 	_, err = i.historyClient.CancelNexusOperation(ctx, &historyservice.CancelNexusOperationRequest{
 		NamespaceId: i.ns.ID().String(),
 		ShardId:     res.RoutingKey.ShardID(i.config.NumHistoryShards),
+		CallerInfo:  args.callerInfo,
 		Request: &nexuspb.CancelOperationRequest{
 			Service:        args.service,
 			Operation:      args.operation,

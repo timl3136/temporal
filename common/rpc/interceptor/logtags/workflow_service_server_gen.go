@@ -3,6 +3,7 @@
 package logtags
 
 import (
+	"go.temporal.io/api/common/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/common/log/tag"
 )
@@ -200,6 +201,13 @@ func (wt *WorkflowTags) extractFromWorkflowServiceServerMessage(message any) []t
 			tag.WorkflowRunID(r.GetExecution().GetRunId()),
 		}
 	case *workflowservice.GetWorkflowExecutionHistoryReverseResponse:
+		return nil
+	case *workflowservice.GetWorkflowExecutionResultRequest:
+		return []tag.Tag{
+			tag.WorkflowID(r.GetExecution().GetWorkflowId()),
+			tag.WorkflowRunID(r.GetExecution().GetRunId()),
+		}
+	case *common.Payload:
 		return nil
 	case *workflowservice.ListActivityExecutionsRequest:
 		return nil

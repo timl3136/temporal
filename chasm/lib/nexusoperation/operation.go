@@ -16,6 +16,7 @@ import (
 	apinexusoperationpb "go.temporal.io/api/nexusoperation/v1" //nolint:importas
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
+	historyservice "go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/chasm/lib/callback"
@@ -344,9 +345,17 @@ func (o *Operation) loadStartArgs(
 ) (startArgs, error) {
 	var (
 		invocationData InvocationData
+		callerInfo     *historyservice.NexusCallerInfo
 		err            error
 	)
 	if store, ok := o.Store.TryGet(ctx); ok {
+		executionKey := ctx.ExecutionKey()
+		callerInfo = &historyservice.NexusCallerInfo{
+			NamespaceId: executionKey.NamespaceID,
+			WorkflowId:  executionKey.BusinessID,
+			RunId:       executionKey.RunID,
+			RequestId:   o.GetRequestId(),
+		}
 		invocationData, err = store.NexusOperationInvocationData(ctx, o)
 		if err != nil {
 			return startArgs{}, err
@@ -387,6 +396,7 @@ func (o *Operation) loadStartArgs(
 		service:                o.GetService(),
 		operation:              o.GetOperation(),
 		requestID:              o.GetRequestId(),
+		callerInfo:             callerInfo,
 		currentTime:            ctx.Now(o),
 		scheduledTime:          o.GetScheduledTime().AsTime(),
 		scheduleToCloseTimeout: o.GetScheduleToCloseTimeout().AsDuration(),

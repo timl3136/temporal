@@ -13,6 +13,7 @@ import (
 	historypb "go.temporal.io/api/history/v1"
 	sdkpb "go.temporal.io/api/sdk/v1"
 	"go.temporal.io/api/serviceerror"
+	historyservice "go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/chasm/lib/nexusoperation"
@@ -25,9 +26,11 @@ import (
 	"go.temporal.io/server/common/namespace"
 	commonnexus "go.temporal.io/server/common/nexus"
 	"go.temporal.io/server/common/nexus/nexustest"
+	sdkconverter "go.temporal.io/server/common/sdk"
 	"go.temporal.io/server/service/history/historybuilder"
 	"go.temporal.io/server/service/history/tests"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -48,7 +51,17 @@ type testContext struct {
 	cancelHandler   CommandHandler
 	history         *historypb.History
 	registry        *Registry
+	nexusProcessor  *chasm.NexusEndpointProcessor
 	metricsCapture  *metricstest.Capture
+}
+
+type callerInfoCapture struct {
+	caller *historyservice.NexusCallerInfo
+}
+
+func (p *callerInfoCapture) ProcessInput(ctx chasm.NexusOperationProcessorContext, _ *emptypb.Empty) (*chasm.NexusOperationProcessorResult, error) {
+	p.caller = ctx.Caller
+	return &chasm.NexusOperationProcessorResult{RoutingKey: chasm.NexusOperationRoutingKeyRandom{}}, nil
 }
 
 func (tcx *testContext) setHasAnyBufferedEvent(value bool) {
@@ -156,8 +169,44 @@ func newTestContext(t *testing.T, cfg *nexusoperation.Config, workflowID ...stri
 		scheduleHandler: scheduleHandler,
 		cancelHandler:   cancelHandler,
 		registry:        wfreg,
+		nexusProcessor:  nexusProcessor,
 		metricsCapture:  metricsCapture,
 	}
+}
+
+func TestScheduleValidationPassesCallerInfo(t *testing.T) {
+	tcx := newTestContext(t, defaultConfig, "caller-workflow-id")
+	tcx.chasmCtx.HandleExecutionKey = func() chasm.ExecutionKey {
+		return chasm.ExecutionKey{
+			NamespaceID: tests.GlobalNamespaceEntry.ID().String(),
+			BusinessID:  "caller-workflow-id",
+			RunID:       "caller-run-id",
+		}
+	}
+	capture := &callerInfoCapture{}
+	serviceProcessor := chasm.NewNexusServiceProcessor("service")
+	serviceProcessor.MustRegisterOperation("op", chasm.NewRegisterableNexusOperationProcessor(capture))
+	tcx.nexusProcessor.MustRegisterServiceProcessor(serviceProcessor)
+	input, err := sdkconverter.PreferProtoDataConverter.ToPayloads(&emptypb.Empty{})
+	require.NoError(t, err)
+	command := &commandpb.Command{
+		Attributes: &commandpb.Command_ScheduleNexusOperationCommandAttributes{
+			ScheduleNexusOperationCommandAttributes: &commandpb.ScheduleNexusOperationCommandAttributes{
+				Endpoint:  commonnexus.SystemEndpoint,
+				Service:   "service",
+				Operation: "op",
+				Input:     input.Payloads[0],
+			},
+		},
+	}
+
+	require.NoError(t, tcx.scheduleHandler(tcx.chasmCtx, tcx.wf, commandValidator{maxPayloadSize: 100}, command, CommandHandlerOptions{WorkflowTaskCompletedEventID: 1}))
+	require.Len(t, tcx.history.Events, 1)
+	attrs := tcx.history.Events[0].GetNexusOperationScheduledEventAttributes()
+	require.Equal(t, tests.GlobalNamespaceEntry.ID().String(), capture.caller.GetNamespaceId())
+	require.Equal(t, "caller-workflow-id", capture.caller.GetWorkflowId())
+	require.Equal(t, "caller-run-id", capture.caller.GetRunId())
+	require.Equal(t, attrs.GetRequestId(), capture.caller.GetRequestId())
 }
 
 func TestHandleScheduleCommand(t *testing.T) {

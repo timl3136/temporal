@@ -2,6 +2,8 @@ module go.temporal.io/server
 
 go 1.27.4
 
+replace go.temporal.io/api => /Users/timli/.t3/worktrees/temporal-api-go/result-contract-go
+
 retract (
 	v1.30.0
 	v1.26.1 // Contains retractions only.

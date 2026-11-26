@@ -13,6 +13,7 @@ import (
 	context "context"
 	reflect "reflect"
 
+	common "go.temporal.io/api/common/v1"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 	gomock "go.uber.org/mock/gomock"
 	grpc "google.golang.org/grpc"
@@ -860,6 +861,26 @@ func (mr *MockWorkflowServiceClientMockRecorder) GetWorkflowExecutionHistoryReve
 	mr.mock.ctrl.T.Helper()
 	varargs := append([]any{ctx, in}, opts...)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetWorkflowExecutionHistoryReverse", reflect.TypeOf((*MockWorkflowServiceClient)(nil).GetWorkflowExecutionHistoryReverse), varargs...)
+}
+
+// GetWorkflowExecutionResult mocks base method.
+func (m *MockWorkflowServiceClient) GetWorkflowExecutionResult(ctx context.Context, in *workflowservice.GetWorkflowExecutionResultRequest, opts ...grpc.CallOption) (*common.Payload, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{ctx, in}
+	for _, a := range opts {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "GetWorkflowExecutionResult", varargs...)
+	ret0, _ := ret[0].(*common.Payload)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetWorkflowExecutionResult indicates an expected call of GetWorkflowExecutionResult.
+func (mr *MockWorkflowServiceClientMockRecorder) GetWorkflowExecutionResult(ctx, in any, opts ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{ctx, in}, opts...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetWorkflowExecutionResult", reflect.TypeOf((*MockWorkflowServiceClient)(nil).GetWorkflowExecutionResult), varargs...)
 }
 
 // ListActivityExecutions mocks base method.

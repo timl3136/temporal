@@ -14,21 +14,23 @@ var EnabledCallbackKinds = dynamicconfig.NewNamespaceTypedSettingWithConverter(
 )
 
 type Config struct {
-	maxIDLengthLimit                   dynamicconfig.IntPropertyFn
-	defaultWorkflowRetrySettings       dynamicconfig.TypedPropertyFnWithNamespaceFilter[retrypolicy.DefaultRetrySettings]
-	enableSignalWithStartFromWorkflow  dynamicconfig.BoolPropertyFnWithNamespaceFilter
-	workflowTimeSkippingEnabled        dynamicconfig.BoolPropertyFnWithNamespaceFilter
-	timeSkippingMaxSkipPerSession      dynamicconfig.IntPropertyFnWithNamespaceFilter
-	timeSkippingMaxAccumulatedDuration dynamicconfig.DurationPropertyFn
+	maxIDLengthLimit                             dynamicconfig.IntPropertyFn
+	defaultWorkflowRetrySettings                 dynamicconfig.TypedPropertyFnWithNamespaceFilter[retrypolicy.DefaultRetrySettings]
+	enableSignalWithStartFromWorkflow            dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	enableGetWorkflowExecutionResultFromWorkflow dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	workflowTimeSkippingEnabled                  dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	timeSkippingMaxSkipPerSession                dynamicconfig.IntPropertyFnWithNamespaceFilter
+	timeSkippingMaxAccumulatedDuration           dynamicconfig.DurationPropertyFn
 }
 
 func NewConfig(dc *dynamicconfig.Collection) Config {
 	return Config{
-		maxIDLengthLimit:                   dynamicconfig.MaxIDLengthLimit.Get(dc),
-		defaultWorkflowRetrySettings:       dynamicconfig.DefaultWorkflowRetryPolicy.Get(dc),
-		enableSignalWithStartFromWorkflow:  dynamicconfig.EnableSignalWithStartFromWorkflow.Get(dc),
-		workflowTimeSkippingEnabled:        dynamicconfig.WorkflowTimeSkippingEnabled.Get(dc),
-		timeSkippingMaxSkipPerSession:      dynamicconfig.TimeSkippingMaxSkipPerSession.Get(dc),
-		timeSkippingMaxAccumulatedDuration: dynamicconfig.TimeSkippingMaxAccumulatedDuration.Get(dc),
+		maxIDLengthLimit:                             dynamicconfig.MaxIDLengthLimit.Get(dc),
+		defaultWorkflowRetrySettings:                 dynamicconfig.DefaultWorkflowRetryPolicy.Get(dc),
+		enableSignalWithStartFromWorkflow:            dynamicconfig.EnableSignalWithStartFromWorkflow.Get(dc),
+		enableGetWorkflowExecutionResultFromWorkflow: dynamicconfig.EnableGetWorkflowExecutionResultFromWorkflow.Get(dc),
+		workflowTimeSkippingEnabled:                  dynamicconfig.WorkflowTimeSkippingEnabled.Get(dc),
+		timeSkippingMaxSkipPerSession:                dynamicconfig.TimeSkippingMaxSkipPerSession.Get(dc),
+		timeSkippingMaxAccumulatedDuration:           dynamicconfig.TimeSkippingMaxAccumulatedDuration.Get(dc),
 	}
 }

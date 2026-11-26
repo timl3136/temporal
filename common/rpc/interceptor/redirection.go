@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/client"
 	"go.temporal.io/server/common/api"
@@ -40,9 +41,10 @@ var (
 		"UpdateNamespace":    func() any { return &workflowservice.UpdateNamespaceResponse{} },
 
 		// Cluster info APIs, Cluster info APIs does not require redirection
-		"GetSearchAttributes": func() any { return &workflowservice.GetSearchAttributesResponse{} },
-		"GetClusterInfo":      func() any { return &workflowservice.GetClusterInfoResponse{} },
-		"GetSystemInfo":       func() any { return &workflowservice.GetSystemInfoResponse{} },
+		"GetSearchAttributes":        func() any { return &workflowservice.GetSearchAttributesResponse{} },
+		"GetClusterInfo":             func() any { return &workflowservice.GetClusterInfoResponse{} },
+		"GetSystemInfo":              func() any { return &workflowservice.GetSystemInfoResponse{} },
+		"GetWorkflowExecutionResult": func() any { return &commonpb.Payload{} },
 	}
 
 	globalAPIResponses = map[string]responseConstructorFn{

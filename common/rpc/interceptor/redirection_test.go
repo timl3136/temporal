@@ -92,9 +92,10 @@ func (s *redirectionInterceptorSuite) TestLocalAPI() {
 		"RegisterNamespace":  {},
 		"UpdateNamespace":    {},
 
-		"GetSearchAttributes": {},
-		"GetClusterInfo":      {},
-		"GetSystemInfo":       {},
+		"GetSearchAttributes":        {},
+		"GetClusterInfo":             {},
+		"GetSystemInfo":              {},
+		"GetWorkflowExecutionResult": {},
 	}, apis)
 }
 

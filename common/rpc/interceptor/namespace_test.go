@@ -24,10 +24,11 @@ type (
 
 var (
 	frontendAPIExcluded = map[string]struct{}{
-		"GetClusterInfo":      {},
-		"GetSystemInfo":       {},
-		"GetSearchAttributes": {},
-		"ListNamespaces":      {},
+		"GetClusterInfo":             {},
+		"GetSystemInfo":              {},
+		"GetSearchAttributes":        {},
+		"GetWorkflowExecutionResult": {},
+		"ListNamespaces":             {},
 	}
 
 	matchingAPIExcluded = map[string]struct{}{

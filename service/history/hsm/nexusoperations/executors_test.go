@@ -1522,6 +1522,7 @@ func TestProcessCancelationTask_OperationCompleted(t *testing.T) {
 }
 
 func TestProcessCancelationTask_SystemEndpoint(t *testing.T) {
+	const callerRequestID = "nexus-caller-request-id"
 	cases := []struct {
 		name                  string
 		setupHistoryClient    func(*testing.T, *gomock.Controller) resource.HistoryClient
@@ -1533,13 +1534,21 @@ func TestProcessCancelationTask_SystemEndpoint(t *testing.T) {
 			name: "success",
 			setupHistoryClient: func(t *testing.T, ctrl *gomock.Controller) resource.HistoryClient {
 				mockHistoryClient := historyservicemock.NewMockHistoryServiceClient(ctrl)
-				mockHistoryClient.EXPECT().CancelNexusOperation(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-					&historyservice.CancelNexusOperationResponse{}, nil,
+				mockHistoryClient.EXPECT().CancelNexusOperation(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ context.Context, request *historyservice.CancelNexusOperationRequest, _ ...grpc.CallOption) (*historyservice.CancelNexusOperationResponse, error) {
+						require.Equal(t, &historyservice.NexusCallerInfo{
+							NamespaceId: "ns-id",
+							WorkflowId:  "wf-id",
+							RunId:       "run-id",
+							RequestId:   callerRequestID,
+						}, request.GetCallerInfo())
+						return &historyservice.CancelNexusOperationResponse{}, nil
+					},
 				)
 				return mockHistoryClient
 			},
 			setupChasmRegistry: func(t *testing.T) *chasm.Registry {
-				endpointProcessor := createTestNexusEndpointProcessor(
+				endpointProcessor := createTestNexusEndpointProcessor(t,
 					&chasm.NexusOperationProcessorResult{
 						RoutingKey: mockNexusOperationRoutingKey{shardID: 1},
 					},
@@ -1566,7 +1575,7 @@ func TestProcessCancelationTask_SystemEndpoint(t *testing.T) {
 				return mockHistoryClient
 			},
 			setupChasmRegistry: func(t *testing.T) *chasm.Registry {
-				endpointProcessor := createTestNexusEndpointProcessor(
+				endpointProcessor := createTestNexusEndpointProcessor(t,
 					&chasm.NexusOperationProcessorResult{
 						RoutingKey: mockNexusOperationRoutingKey{shardID: 1},
 					},
@@ -1594,7 +1603,7 @@ func TestProcessCancelationTask_SystemEndpoint(t *testing.T) {
 				return mockHistoryClient
 			},
 			setupChasmRegistry: func(t *testing.T) *chasm.Registry {
-				endpointProcessor := createTestNexusEndpointProcessor(
+				endpointProcessor := createTestNexusEndpointProcessor(t,
 					&chasm.NexusOperationProcessorResult{
 						RoutingKey: mockNexusOperationRoutingKey{shardID: 1},
 					},
@@ -1620,7 +1629,7 @@ func TestProcessCancelationTask_SystemEndpoint(t *testing.T) {
 				return historyservicemock.NewMockHistoryServiceClient(ctrl)
 			},
 			setupChasmRegistry: func(t *testing.T) *chasm.Registry {
-				endpointProcessor := createTestNexusEndpointProcessor(
+				endpointProcessor := createTestNexusEndpointProcessor(t,
 					nil,
 					errors.New("processor failed"),
 				)
@@ -1645,6 +1654,7 @@ func TestProcessCancelationTask_SystemEndpoint(t *testing.T) {
 			reg := newRegistry(t)
 			event := mustNewScheduledEvent(time.Now(), &historypb.NexusOperationScheduledEventAttributes{
 				ScheduleToCloseTimeout: durationpb.New(time.Hour),
+				RequestId:              callerRequestID,
 			})
 			event.GetNexusOperationScheduledEventAttributes().Input = mustToPayload(t, testOperationProcessorInput{"test"})
 			// Set endpoint to SystemEndpoint
@@ -1799,22 +1809,29 @@ type testOperationProcessorInput struct {
 
 // testOperationProcessor is a simple operation processor for testing
 type testOperationProcessor struct {
+	t      *testing.T
 	result *chasm.NexusOperationProcessorResult
 	err    error
 }
 
 func (t *testOperationProcessor) ProcessInput(ctx chasm.NexusOperationProcessorContext, input *testOperationProcessorInput) (*chasm.NexusOperationProcessorResult, error) {
+	require.NotNil(t.t, ctx.Caller)
+	require.Equal(t.t, "ns-id", ctx.Caller.GetNamespaceId())
+	require.Equal(t.t, "wf-id", ctx.Caller.GetWorkflowId())
+	require.Equal(t.t, "run-id", ctx.Caller.GetRunId())
+	require.Equal(t.t, ctx.RequestID, ctx.Caller.GetRequestId())
 	// Mutate the input to verify that the mutated input is passed to the history service.
 	input.Value = "processed:" + input.Value
 	return t.result, t.err
 }
 
 // createTestNexusEndpointProcessor creates a NexusEndpointProcessor with a mock operation for testing
-func createTestNexusEndpointProcessor(result *chasm.NexusOperationProcessorResult, err error) *chasm.NexusEndpointProcessor {
+func createTestNexusEndpointProcessor(t *testing.T, result *chasm.NexusOperationProcessorResult, err error) *chasm.NexusEndpointProcessor {
 	processor := chasm.NewNexusEndpointProcessor()
 	serviceProcessor := chasm.NewNexusServiceProcessor("service")
 
 	testOp := &testOperationProcessor{
+		t:      t,
 		result: result,
 		err:    err,
 	}
@@ -1827,6 +1844,7 @@ func createTestNexusEndpointProcessor(result *chasm.NexusOperationProcessorResul
 
 // TestProcessInvocationTask_SystemEndpoint tests the system endpoint execution path
 func TestProcessInvocationTask_SystemEndpoint(t *testing.T) {
+	const callerRequestID = "nexus-caller-request-id"
 	handlerLink := &commonpb.Link_WorkflowEvent{
 		Namespace:  "handler-ns",
 		WorkflowId: "handler-wf-id",
@@ -1850,24 +1868,32 @@ func TestProcessInvocationTask_SystemEndpoint(t *testing.T) {
 			name: "async start",
 			setupHistoryClient: func(t *testing.T, ctrl *gomock.Controller) resource.HistoryClient {
 				mockHistoryClient := historyservicemock.NewMockHistoryServiceClient(ctrl)
-				mockHistoryClient.EXPECT().StartNexusOperation(gomock.Any(), gomock.Any(), gomock.Any()).Return(
-					&historyservice.StartNexusOperationResponse{
-						Response: &nexuspb.StartOperationResponse{
-							Variant: &nexuspb.StartOperationResponse_AsyncSuccess{
-								AsyncSuccess: &nexuspb.StartOperationResponse_Async{
-									OperationToken: "system-op-token",
-									Links: commonnexus.ConvertLinksToProto([]nexus.Link{
-										commonnexus.ConvertLinkWorkflowEventToNexusLink(handlerLink),
-									}),
+				mockHistoryClient.EXPECT().StartNexusOperation(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ context.Context, request *historyservice.StartNexusOperationRequest, _ ...grpc.CallOption) (*historyservice.StartNexusOperationResponse, error) {
+						require.Equal(t, &historyservice.NexusCallerInfo{
+							NamespaceId: "ns-id",
+							WorkflowId:  "wf-id",
+							RunId:       "run-id",
+							RequestId:   callerRequestID,
+						}, request.GetCallerInfo())
+						return &historyservice.StartNexusOperationResponse{
+							Response: &nexuspb.StartOperationResponse{
+								Variant: &nexuspb.StartOperationResponse_AsyncSuccess{
+									AsyncSuccess: &nexuspb.StartOperationResponse_Async{
+										OperationToken: "system-op-token",
+										Links: commonnexus.ConvertLinksToProto([]nexus.Link{
+											commonnexus.ConvertLinkWorkflowEventToNexusLink(handlerLink),
+										}),
+									},
 								},
 							},
-						},
-					}, nil,
+						}, nil
+					},
 				)
 				return mockHistoryClient
 			},
 			setupChasmRegistry: func(t *testing.T) *chasm.Registry {
-				endpointProcessor := createTestNexusEndpointProcessor(
+				endpointProcessor := createTestNexusEndpointProcessor(t,
 					&chasm.NexusOperationProcessorResult{
 						RoutingKey: mockNexusOperationRoutingKey{shardID: 1},
 					},
@@ -1928,7 +1954,7 @@ func TestProcessInvocationTask_SystemEndpoint(t *testing.T) {
 				return mockHistoryClient
 			},
 			setupChasmRegistry: func(t *testing.T) *chasm.Registry {
-				endpointProcessor := createTestNexusEndpointProcessor(
+				endpointProcessor := createTestNexusEndpointProcessor(t,
 					&chasm.NexusOperationProcessorResult{
 						RoutingKey: mockNexusOperationRoutingKey{shardID: 1},
 					},
@@ -1982,7 +2008,7 @@ func TestProcessInvocationTask_SystemEndpoint(t *testing.T) {
 				return mockHistoryClient
 			},
 			setupChasmRegistry: func(t *testing.T) *chasm.Registry {
-				endpointProcessor := createTestNexusEndpointProcessor(
+				endpointProcessor := createTestNexusEndpointProcessor(t,
 					&chasm.NexusOperationProcessorResult{
 						RoutingKey: mockNexusOperationRoutingKey{shardID: 1},
 					},
@@ -2025,7 +2051,7 @@ func TestProcessInvocationTask_SystemEndpoint(t *testing.T) {
 				return mockHistoryClient
 			},
 			setupChasmRegistry: func(t *testing.T) *chasm.Registry {
-				endpointProcessor := createTestNexusEndpointProcessor(
+				endpointProcessor := createTestNexusEndpointProcessor(t,
 					&chasm.NexusOperationProcessorResult{
 						RoutingKey: mockNexusOperationRoutingKey{shardID: 1},
 					},
@@ -2052,7 +2078,7 @@ func TestProcessInvocationTask_SystemEndpoint(t *testing.T) {
 				return historyservicemock.NewMockHistoryServiceClient(ctrl)
 			},
 			setupChasmRegistry: func(t *testing.T) *chasm.Registry {
-				endpointProcessor := createTestNexusEndpointProcessor(
+				endpointProcessor := createTestNexusEndpointProcessor(t,
 					nil,
 					errors.New("processor failed"),
 				)
@@ -2079,6 +2105,7 @@ func TestProcessInvocationTask_SystemEndpoint(t *testing.T) {
 			reg := newRegistry(t)
 			event := mustNewScheduledEvent(time.Now(), &historypb.NexusOperationScheduledEventAttributes{
 				ScheduleToCloseTimeout: durationpb.New(time.Hour),
+				RequestId:              callerRequestID,
 			})
 			event.GetNexusOperationScheduledEventAttributes().Input = mustToPayload(t, testOperationProcessorInput{"test"})
 			// Set endpoint to SystemEndpoint

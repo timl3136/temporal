@@ -1442,12 +1442,27 @@ message UnpauseWorkflowExecutionRequest {
 
 message UnpauseWorkflowExecutionResponse {}
 
+// NexusCallerInfo identifies the workflow execution that scheduled a Nexus operation.
+// Standalone Nexus operations omit this field.
+message NexusCallerInfo {
+  // The namespace ID of the workflow execution.
+  string namespace_id = 1;
+  // The workflow ID of the workflow execution.
+  string workflow_id = 2;
+  // The run ID of the workflow execution.
+  string run_id = 3;
+  // The scheduled Nexus operation request ID.
+  string request_id = 4;
+}
+
 message StartNexusOperationRequest {
   option (routing).shard_id = "shard_id";
 
   string namespace_id = 1;
   int32 shard_id = 2;
   temporal.api.nexus.v1.StartOperationRequest request = 3;
+  // The workflow execution that scheduled this operation, if any.
+  NexusCallerInfo caller_info = 4;
 }
 
 message StartNexusOperationResponse {
@@ -1460,6 +1475,8 @@ message CancelNexusOperationRequest {
   string namespace_id = 1;
   int32 shard_id = 2;
   temporal.api.nexus.v1.CancelOperationRequest request = 3;
+  // The workflow execution that scheduled this operation, if any.
+  NexusCallerInfo caller_info = 4;
 }
 
 message CancelNexusOperationResponse {

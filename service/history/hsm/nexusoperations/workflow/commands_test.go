@@ -14,6 +14,7 @@ import (
 	historypb "go.temporal.io/api/history/v1"
 	sdkpb "go.temporal.io/api/sdk/v1"
 	"go.temporal.io/api/serviceerror"
+	historyservice "go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
 	chasmnexus "go.temporal.io/server/chasm/lib/nexusoperation"
@@ -25,6 +26,7 @@ import (
 	"go.temporal.io/server/common/namespace"
 	commonnexus "go.temporal.io/server/common/nexus"
 	"go.temporal.io/server/common/nexus/nexustest"
+	sdkconverter "go.temporal.io/server/common/sdk"
 	"go.temporal.io/server/service/history/hsm"
 	"go.temporal.io/server/service/history/hsm/nexusoperations"
 	opsworkflow "go.temporal.io/server/service/history/hsm/nexusoperations/workflow"
@@ -33,6 +35,7 @@ import (
 	"go.temporal.io/server/service/history/workflow"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -46,11 +49,22 @@ func (v commandValidator) IsValidPayloadSize(size int) bool {
 
 type testContext struct {
 	execInfo        *persistencespb.WorkflowExecutionInfo
+	execState       *persistencespb.WorkflowExecutionState
 	ms              *historyi.MockMutableState
 	scheduleHandler workflow.CommandHandler
 	cancelHandler   workflow.CommandHandler
 	history         *historypb.History
 	metricsCapture  *metricstest.Capture
+	callerCapture   *callerInfoCapture
+}
+
+type callerInfoCapture struct {
+	caller *historyservice.NexusCallerInfo
+}
+
+func (p *callerInfoCapture) ProcessInput(ctx chasm.NexusOperationProcessorContext, _ *emptypb.Empty) (*chasm.NexusOperationProcessorResult, error) {
+	p.caller = ctx.Caller
+	return &chasm.NexusOperationProcessorResult{RoutingKey: chasm.NexusOperationRoutingKeyRandom{}}, nil
 }
 
 var defaultConfig = &nexusoperations.Config{
@@ -79,6 +93,10 @@ func newTestContext(t *testing.T, cfg *nexusoperations.Config) testContext {
 	chReg := workflow.NewCommandHandlerRegistry()
 	chasmReg := chasm.NewRegistry(log.NewTestLogger())
 	require.NoError(t, chasmReg.Register(testlib.Library))
+	callerCapture := &callerInfoCapture{}
+	callerServiceProcessor := chasm.NewNexusServiceProcessor("caller-info-test")
+	callerServiceProcessor.MustRegisterOperation("test", chasm.NewRegisterableNexusOperationProcessor(callerCapture))
+	chasmReg.NexusEndpointProcessor.MustRegisterServiceProcessor(callerServiceProcessor)
 	metricsHandler := metricstest.NewCaptureHandler()
 	metricsCapture := metricsHandler.StartCapture()
 	t.Cleanup(func() { metricsHandler.StopCapture(metricsCapture) })
@@ -108,9 +126,10 @@ func newTestContext(t *testing.T, cfg *nexusoperations.Config) testContext {
 	ms.EXPECT().GenerateEventLoadToken(gomock.Any()).Return([]byte("token"), nil).AnyTimes()
 
 	execInfo := &persistencespb.WorkflowExecutionInfo{}
+	execState := &persistencespb.WorkflowExecutionState{}
 	ms.EXPECT().GetNamespaceEntry().Return(tests.GlobalNamespaceEntry).AnyTimes()
 	ms.EXPECT().GetExecutionInfo().Return(execInfo).AnyTimes()
-	ms.EXPECT().GetExecutionState().Return(&persistencespb.WorkflowExecutionState{}).AnyTimes()
+	ms.EXPECT().GetExecutionState().Return(execState).AnyTimes()
 	ms.EXPECT().GetCurrentVersion().Return(int64(1)).AnyTimes()
 	ms.EXPECT().NextTransitionCount().Return(int64(2)).AnyTimes()
 	scheduleHandler, ok := chReg.Handler(enumspb.COMMAND_TYPE_SCHEDULE_NEXUS_OPERATION)
@@ -120,12 +139,44 @@ func newTestContext(t *testing.T, cfg *nexusoperations.Config) testContext {
 
 	return testContext{
 		execInfo:        execInfo,
+		execState:       execState,
 		ms:              ms,
 		history:         history,
 		scheduleHandler: scheduleHandler,
 		cancelHandler:   cancelHandler,
 		metricsCapture:  metricsCapture,
+		callerCapture:   callerCapture,
 	}
+}
+
+func TestScheduleValidationPassesCallerInfo(t *testing.T) {
+	cfg := *defaultConfig
+	cfg.MaxServiceNameLength = dynamicconfig.GetIntPropertyFnFilteredByNamespace(len("caller-info-test"))
+	cfg.MaxOperationNameLength = dynamicconfig.GetIntPropertyFnFilteredByNamespace(len("test"))
+	tcx := newTestContext(t, &cfg)
+	tcx.execInfo.NamespaceId = tests.GlobalNamespaceEntry.ID().String()
+	tcx.execInfo.WorkflowId = "caller-workflow-id"
+	tcx.execState.RunId = "caller-run-id"
+	input, err := sdkconverter.PreferProtoDataConverter.ToPayloads(&emptypb.Empty{})
+	require.NoError(t, err)
+	command := &commandpb.Command{
+		Attributes: &commandpb.Command_ScheduleNexusOperationCommandAttributes{
+			ScheduleNexusOperationCommandAttributes: &commandpb.ScheduleNexusOperationCommandAttributes{
+				Endpoint:  commonnexus.SystemEndpoint,
+				Service:   "caller-info-test",
+				Operation: "test",
+				Input:     input.Payloads[0],
+			},
+		},
+	}
+
+	require.NoError(t, tcx.scheduleHandler(context.Background(), tcx.ms, commandValidator{maxPayloadSize: 100}, 1, command))
+	require.Len(t, tcx.history.Events, 1)
+	attrs := tcx.history.Events[0].GetNexusOperationScheduledEventAttributes()
+	require.Equal(t, tests.GlobalNamespaceEntry.ID().String(), tcx.callerCapture.caller.GetNamespaceId())
+	require.Equal(t, "caller-workflow-id", tcx.callerCapture.caller.GetWorkflowId())
+	require.Equal(t, "caller-run-id", tcx.callerCapture.caller.GetRunId())
+	require.Equal(t, attrs.GetRequestId(), tcx.callerCapture.caller.GetRequestId())
 }
 
 func TestHandleScheduleCommand(t *testing.T) {

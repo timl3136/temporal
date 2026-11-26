@@ -6,6 +6,7 @@ import (
 
 	"github.com/nexus-rpc/sdk-go/nexus"
 	commonpb "go.temporal.io/api/common/v1"
+	historyservice "go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/namespace"
 	sdkconverter "go.temporal.io/server/common/sdk"
@@ -19,7 +20,9 @@ type NexusOperationProcessorContext struct {
 	// RequestID is a unique identifier for the incoming operation request, used for correlation and idempotency
 	// across retries.
 	RequestID string
-	Links     []nexus.Link
+	// Caller identifies the workflow execution that scheduled this operation, if any.
+	Caller *historyservice.NexusCallerInfo
+	Links  []nexus.Link
 	// A boolean indicating whether the operation processor framework should re-serialize the input and store it in the
 	// [NexusOperationProcessorResult.ReserializedInputPayload] field. Processor implementations may mutate the input regardless.
 	ReserializeInputPayload bool

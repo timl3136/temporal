@@ -5,6 +5,7 @@ package frontend
 import (
 	"context"
 
+	"go.temporal.io/api/common/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"google.golang.org/grpc"
 )
@@ -417,6 +418,16 @@ func (c *clientImpl) GetWorkflowExecutionHistoryReverse(
 	ctx, cancel := c.createContext(ctx)
 	defer cancel()
 	return c.client.GetWorkflowExecutionHistoryReverse(ctx, request, opts...)
+}
+
+func (c *clientImpl) GetWorkflowExecutionResult(
+	ctx context.Context,
+	request *workflowservice.GetWorkflowExecutionResultRequest,
+	opts ...grpc.CallOption,
+) (*common.Payload, error) {
+	ctx, cancel := c.createContext(ctx)
+	defer cancel()
+	return c.client.GetWorkflowExecutionResult(ctx, request, opts...)
 }
 
 func (c *clientImpl) ListActivityExecutions(

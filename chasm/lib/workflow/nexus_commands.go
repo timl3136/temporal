@@ -12,6 +12,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/serviceerror"
+	historyservice "go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/chasm/lib/nexusoperation"
 	"go.temporal.io/server/common/log"
@@ -66,9 +67,16 @@ func (ch *nexusCommandHandler) handleScheduleCommand(
 			}
 		}
 		// Run ProcessInput for validation.
+		executionKey := ctx.ExecutionKey()
 		_, err := ch.nexusProcessor.ProcessInput(chasm.NexusOperationProcessorContext{
 			Namespace: ns,
 			RequestID: requestID,
+			Caller: &historyservice.NexusCallerInfo{
+				NamespaceId: executionKey.NamespaceID,
+				WorkflowId:  executionKey.BusinessID,
+				RunId:       executionKey.RunID,
+				RequestId:   requestID,
+			},
 			// Links are not needed for validation.
 		}, attrs.Service, attrs.Operation, attrs.Input)
 		if err != nil {

@@ -7101,3 +7101,12 @@ func (s *WorkflowHandlerSuite) TestOnNamespaceStateChange_CancelsPollsOfSoftDele
 		})
 	}
 }
+
+func TestGetWorkflowExecutionResultUnimplemented(t *testing.T) {
+	_, err := (&WorkflowHandler{}).GetWorkflowExecutionResult(
+		t.Context(),
+		&workflowservice.GetWorkflowExecutionResultRequest{},
+	)
+	var unimplemented *serviceerror.Unimplemented
+	require.ErrorAs(t, err, &unimplemented)
+}

@@ -5,6 +5,7 @@ package frontend
 import (
 	"context"
 
+	"go.temporal.io/api/common/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"google.golang.org/grpc"
 
@@ -620,6 +621,21 @@ func (c *retryableClient) GetWorkflowExecutionHistoryReverse(
 	op := func(ctx context.Context) error {
 		var err error
 		resp, err = c.client.GetWorkflowExecutionHistoryReverse(ctx, request, opts...)
+		return err
+	}
+	err := backoff.ThrottleRetryContext(ctx, op, c.policy, c.isRetryable)
+	return resp, err
+}
+
+func (c *retryableClient) GetWorkflowExecutionResult(
+	ctx context.Context,
+	request *workflowservice.GetWorkflowExecutionResultRequest,
+	opts ...grpc.CallOption,
+) (*common.Payload, error) {
+	var resp *common.Payload
+	op := func(ctx context.Context) error {
+		var err error
+		resp, err = c.client.GetWorkflowExecutionResult(ctx, request, opts...)
 		return err
 	}
 	err := backoff.ThrottleRetryContext(ctx, op, c.policy, c.isRetryable)

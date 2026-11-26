@@ -1011,8 +1011,15 @@ func (wh *WorkflowHandler) convertToMultiOperationResponse(
 	return resp, nil
 }
 
-// GetWorkflowExecutionHistory returns the history of specified workflow execution.  It fails with 'EntityNotExistError' if specified workflow
-// execution in unknown to the service.
+func (wh *WorkflowHandler) GetWorkflowExecutionResult(
+	_ context.Context,
+	_ *workflowservice.GetWorkflowExecutionResultRequest,
+) (*commonpb.Payload, error) {
+	return nil, serviceerror.NewUnimplemented("GetWorkflowExecutionResult is not implemented")
+}
+
+// GetWorkflowExecutionHistory returns the history of specified workflow execution. It fails with 'EntityNotExistError' if the specified workflow
+// execution is unknown to the service.
 func (wh *WorkflowHandler) GetWorkflowExecutionHistory(ctx context.Context, request *workflowservice.GetWorkflowExecutionHistoryRequest) (_ *workflowservice.GetWorkflowExecutionHistoryResponse, retError error) {
 	defer log.CapturePanic(wh.logger, &retError)
 

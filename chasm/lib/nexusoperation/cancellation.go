@@ -8,6 +8,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	failurepb "go.temporal.io/api/failure/v1"
 	"go.temporal.io/api/serviceerror"
+	historyservice "go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/chasm"
 	nexusoperationpb "go.temporal.io/server/chasm/lib/nexusoperation/gen/nexusoperationpb/v1"
 	"go.temporal.io/server/common/backoff"
@@ -60,6 +61,7 @@ type cancelArgs struct {
 	operation              string
 	token                  string
 	requestID              string
+	callerInfo             *historyservice.NexusCallerInfo
 	endpointName           string
 	endpointID             string
 	currentTime            time.Time
@@ -97,7 +99,15 @@ func (c *Cancellation) loadArgs(
 	op := c.Operation.Get(ctx)
 
 	var invocationData InvocationData
+	var callerInfo *historyservice.NexusCallerInfo
 	if store, ok := op.Store.TryGet(ctx); ok {
+		executionKey := ctx.ExecutionKey()
+		callerInfo = &historyservice.NexusCallerInfo{
+			NamespaceId: executionKey.NamespaceID,
+			WorkflowId:  executionKey.BusinessID,
+			RunId:       executionKey.RunID,
+			RequestId:   op.GetRequestId(),
+		}
 		var err error
 		invocationData, err = store.NexusOperationInvocationData(ctx, op)
 		if err != nil {
@@ -116,6 +126,7 @@ func (c *Cancellation) loadArgs(
 		operation:              op.GetOperation(),
 		token:                  op.GetOperationToken(),
 		requestID:              op.GetRequestId(),
+		callerInfo:             callerInfo,
 		endpointName:           op.GetEndpoint(),
 		endpointID:             op.GetEndpointId(),
 		currentTime:            ctx.Now(c),
