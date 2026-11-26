@@ -450,3 +450,75 @@ func TestWorkflowResultSubscriptionCompletionSource(t *testing.T) {
 	_, ok = updateHost.(callback.ResultSubscriptionCompletionSource)
 	require.False(t, ok)
 }
+
+func TestProcessCloseCallbacks_SkipResultSubscriptions(t *testing.T) {
+	t.Parallel()
+
+	newSub := func(reqID string) *commonpb.Callback {
+		return &commonpb.Callback{
+			Variant: &commonpb.Callback_Nexus_{
+				Nexus: &commonpb.Callback_Nexus{Url: "temporal://system"},
+			},
+			ResultSubscription: &commonpb.Callback_ResultSubscription{
+				RequestId:           reqID,
+				ResultFormatVersion: 1,
+				ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "wf", RunId: "run-1"},
+			},
+		}
+	}
+
+	setup := func(t *testing.T) (*chasm.MockMutableContext, *Workflow) {
+		t.Helper()
+		ctx := newTestCHASMContext(t)
+		wf := newTestWorkflow()
+		require.NoError(t, wf.AddCompletionCallbacks(ctx, timestamppb.Now(), "sub-active", []*commonpb.Callback{newSub("sub-active")}))
+		require.NoError(t, wf.AddCompletionCallbacks(ctx, timestamppb.Now(), "sub-canceled", []*commonpb.Callback{newSub("sub-canceled")}))
+		require.NoError(t, wf.AddCompletionCallbacks(ctx, timestamppb.Now(), "legacy-req", []*commonpb.Callback{nexusCallback("http://legacy")}))
+		require.NoError(t, wf.AddUpdateCompletionCallbacks(ctx, timestamppb.Now(), "upd-1", "upd-req", []*commonpb.Callback{nexusCallback("http://update")}))
+
+		keys := wf.CancelableResultSubscriptionKeys(ctx, map[string]struct{}{"sub-canceled": {}})
+		require.NoError(t, wf.CancelResultSubscriptions(ctx, keys))
+		ctx.Tasks = nil
+		return ctx, wf
+	}
+
+	t.Run("successor_close_skips_result_subscription_and_fires_legacy_and_update", func(t *testing.T) {
+		t.Parallel()
+		ctx, wf := setup(t)
+
+		require.NoError(t, wf.ProcessCloseCallbacks(ctx, true))
+
+		active, ok := wf.FindResultSubscription(ctx, "sub-active")
+		require.True(t, ok)
+		require.Equal(t, callbackspb.CALLBACK_STATUS_STANDBY, active.Status)
+
+		canceled, ok := wf.FindResultSubscription(ctx, "sub-canceled")
+		require.True(t, ok)
+		require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, canceled.Status)
+		require.NotNil(t, canceled.GetLastAttemptFailure().GetCanceledFailureInfo())
+
+		require.Equal(t, callbackspb.CALLBACK_STATUS_SCHEDULED, wf.Callbacks["legacy-req-0"].Get(ctx).Status)
+		require.Equal(t, callbackspb.CALLBACK_STATUS_SCHEDULED, wf.Updates["upd-1"].Get(ctx).Callbacks["upd-req-0"].Get(ctx).Status)
+		require.Len(t, ctx.Tasks, 2)
+	})
+
+	t.Run("terminal_close_fires_active_result_subscription_legacy_and_update", func(t *testing.T) {
+		t.Parallel()
+		ctx, wf := setup(t)
+
+		require.NoError(t, wf.ProcessCloseCallbacks(ctx, false))
+
+		active, ok := wf.FindResultSubscription(ctx, "sub-active")
+		require.True(t, ok)
+		require.Equal(t, callbackspb.CALLBACK_STATUS_SCHEDULED, active.Status)
+
+		canceled, ok := wf.FindResultSubscription(ctx, "sub-canceled")
+		require.True(t, ok)
+		require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, canceled.Status)
+		require.NotNil(t, canceled.GetLastAttemptFailure().GetCanceledFailureInfo())
+
+		require.Equal(t, callbackspb.CALLBACK_STATUS_SCHEDULED, wf.Callbacks["legacy-req-0"].Get(ctx).Status)
+		require.Equal(t, callbackspb.CALLBACK_STATUS_SCHEDULED, wf.Updates["upd-1"].Get(ctx).Callbacks["upd-req-0"].Get(ctx).Status)
+		require.Len(t, ctx.Tasks, 3)
+	})
+}

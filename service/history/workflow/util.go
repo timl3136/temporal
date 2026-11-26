@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"maps"
 
 	commonpb "go.temporal.io/api/common/v1"
 	deploymentpb "go.temporal.io/api/deployment/v1"
@@ -287,9 +288,27 @@ func ShouldReapplyEvent(stateMachineRegistry *hsm.Registry, event *historypb.His
 	return false
 }
 
-func getCompletionCallbacksAsProtoSlice(ctx context.Context, ms historyi.MutableState) ([]*commonpb.Callback, error) {
+func getCompletionCallbacksAsProtoSlice(
+	ctx context.Context,
+	ms historyi.MutableState,
+	resultSubscriptionsOnly bool,
+) ([]*commonpb.Callback, error) {
+	result, err := appendHSMCompletionCallbacks(nil, ms, resultSubscriptionsOnly)
+	if err != nil {
+		return nil, err
+	}
+	return appendCHASMCompletionCallbacks(ctx, result, ms, resultSubscriptionsOnly)
+}
+
+func appendHSMCompletionCallbacks(
+	result []*commonpb.Callback,
+	ms historyi.MutableState,
+	resultSubscriptionsOnly bool,
+) ([]*commonpb.Callback, error) {
+	if ms.HSM() == nil {
+		return result, nil
+	}
 	coll := callbacks.MachineCollection(ms.HSM())
-	result := make([]*commonpb.Callback, 0, coll.Size())
 	for _, node := range coll.List() {
 		cb, err := coll.Data(node.Key.ID)
 		if err != nil {
@@ -301,42 +320,51 @@ func getCompletionCallbacksAsProtoSlice(ctx context.Context, ms historyi.Mutable
 		if cb.State() != enumsspb.CALLBACK_STATE_STANDBY {
 			continue
 		}
+		if resultSubscriptionsOnly && cb.GetCallback().GetResultSubscription() == nil {
+			continue
+		}
 		cbSpec, err := PersistenceCallbackToAPICallback(cb.Callback)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, cbSpec)
 	}
+	return result, nil
+}
 
-	// Collect CHASM callbacks
-	if ms.ChasmEnabled() {
-		wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(ctx)
+func appendCHASMCompletionCallbacks(
+	ctx context.Context,
+	result []*commonpb.Callback,
+	ms historyi.MutableState,
+	resultSubscriptionsOnly bool,
+) ([]*commonpb.Callback, error) {
+	if !ms.ChasmEnabled() {
+		return result, nil
+	}
+	wf, readCtx, err := ms.ChasmWorkflowComponentReadOnly(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, field := range wf.Callbacks {
+		cb := field.Get(readCtx)
+		if cb.Status != callbackspb.CALLBACK_STATUS_STANDBY {
+			continue
+		}
+		if resultSubscriptionsOnly && cb.GetCallback().GetResultSubscription() == nil {
+			continue
+		}
+		cbSpec, err := cb.ToAPICallback()
 		if err != nil {
 			return nil, err
 		}
-
-		for _, field := range wf.Callbacks {
-			cb := field.Get(ctx)
-			// Only include callbacks in STANDBY state (not already triggered)
-			if cb.Status != callbackspb.CALLBACK_STATUS_STANDBY {
-				continue
-			}
-			// Convert CHASM callback to API callback
-			cbSpec, err := cb.ToAPICallback()
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, cbSpec)
-		}
+		result = append(result, cbSpec)
 	}
-	// }
-
 	return result, nil
 }
 
 func PersistenceCallbackToAPICallback(cb *persistencespb.Callback) (*commonpb.Callback, error) {
 	res := &commonpb.Callback{
-		Links:              cb.GetLinks(),
+		Links:              common.CloneProtoSlice(cb.GetLinks()),
 		ResultSubscription: common.CloneProto(cb.GetResultSubscription()),
 	}
 	switch variant := cb.Variant.(type) {
@@ -344,7 +372,7 @@ func PersistenceCallbackToAPICallback(cb *persistencespb.Callback) (*commonpb.Ca
 		res.Variant = &commonpb.Callback_Nexus_{
 			Nexus: &commonpb.Callback_Nexus{
 				Url:    variant.Nexus.GetUrl(),
-				Header: variant.Nexus.GetHeader(),
+				Header: maps.Clone(variant.Nexus.GetHeader()),
 			},
 		}
 	default:

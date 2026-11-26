@@ -2891,7 +2891,7 @@ func (ms *MutableStateImpl) addWorkflowExecutionStartedEventForContinueAsNew(
 	// for other fields as well.
 	runTimeout := command.GetWorkflowRunTimeout()
 
-	completionCallbacks, err := getCompletionCallbacksAsProtoSlice(ctx, previousExecutionState)
+	completionCallbacks, err := getCompletionCallbacksAsProtoSlice(ctx, previousExecutionState, false)
 	if err != nil {
 		return nil, err
 	}
@@ -3641,11 +3641,85 @@ func (ms *MutableStateImpl) addCompletionCallbacks(
 	if len(completionCallbacks) == 0 {
 		return nil
 	}
+	completionCallbacks, err := ms.filterExistingResultSubscriptionCallbacks(completionCallbacks)
+	if err != nil {
+		return err
+	}
+	if len(completionCallbacks) == 0 {
+		return nil
+	}
 	if ms.attachesCallbacksToChasm("") {
 		return ms.addCompletionCallbacksChasm(event, requestID, completionCallbacks)
 	}
 
 	return ms.addCompletionCallbacksHsm(event, requestID, completionCallbacks)
+}
+
+// filterExistingResultSubscriptionCallbacks drops result subscription callbacks whose subscription
+// request ID already exists on this run (in any state, including canceled) so replaying or
+// reapplying an attach event cannot duplicate or resurrect a subscription across runs or resets.
+func (ms *MutableStateImpl) filterExistingResultSubscriptionCallbacks(
+	completionCallbacks []*commonpb.Callback,
+) ([]*commonpb.Callback, error) {
+	hasResultSub := false
+	for _, cb := range completionCallbacks {
+		if cb.GetResultSubscription().GetRequestId() != "" {
+			hasResultSub = true
+			break
+		}
+	}
+	if !hasResultSub {
+		return completionCallbacks, nil
+	}
+
+	existing, err := ms.existingResultSubscriptionRequestIDs()
+	if err != nil {
+		return nil, err
+	}
+
+	filtered := make([]*commonpb.Callback, 0, len(completionCallbacks))
+	for _, cb := range completionCallbacks {
+		if subReqID := cb.GetResultSubscription().GetRequestId(); subReqID != "" {
+			if _, exists := existing[subReqID]; exists {
+				continue
+			}
+			existing[subReqID] = struct{}{}
+		}
+		filtered = append(filtered, cb)
+	}
+	return filtered, nil
+}
+
+func (ms *MutableStateImpl) existingResultSubscriptionRequestIDs() (map[string]struct{}, error) {
+	existing := make(map[string]struct{})
+	if ms.ChasmEnabled() {
+		wf, readCtx, err := ms.ChasmWorkflowComponentReadOnly(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		for _, field := range wf.Callbacks {
+			cb, ok := field.TryGet(readCtx)
+			if !ok {
+				continue
+			}
+			if subReqID := cb.GetCallback().GetResultSubscription().GetRequestId(); subReqID != "" {
+				existing[subReqID] = struct{}{}
+			}
+		}
+	}
+	if ms.HSM() != nil {
+		coll := callbacks.MachineCollection(ms.HSM())
+		for _, node := range coll.List() {
+			cb, err := coll.Data(node.Key.ID)
+			if err != nil {
+				return nil, err
+			}
+			if subReqID := cb.GetCallback().GetResultSubscription().GetRequestId(); subReqID != "" {
+				existing[subReqID] = struct{}{}
+			}
+		}
+	}
+	return existing, nil
 }
 
 // addCompletionCallbacksHsm creates completion callbacks using the HSM implementation.
@@ -7583,22 +7657,27 @@ func (ms *MutableStateImpl) processCloseCallbacks() error {
 		return nil
 	}
 
+	// shortcut: resetting an earlier base run of a CAN chain leaves ResetRunId empty on the terminated descendant, so result subscriptions on that descendant still fire; upgrade when workflow_resetter distinguishes same-chain resets from unrelated-chain resets.
+	// Result subscription callbacks follow the chain across non-terminal closes with a successor
+	// run (such as cron), while legacy and third-party callbacks keep firing on those closes.
+	skipResultSubscriptions := ms.executionInfo.GetNewExecutionRunId() != ""
+
 	// Process CHASM callbacks if CHASM is enabled. Note that we check ChasmEnabled() rather than
 	// chasmCallbacksEnabled() to ensure that callbacks created when both HSM and CHASM callbacks
 	// were enabled can still be triggered even if the EnableCHASMCallbacks dynamic config is later
 	// turned off. Once created in CHASM, callbacks should always be processed as long as CHASM is enabled.
 	if ms.ChasmEnabled() {
-		if err := ms.processCloseCallbacksChasm(); err != nil {
+		if err := ms.processCloseCallbacksChasm(skipResultSubscriptions); err != nil {
 			return err
 		}
 	}
 
 	// Always process HSM callbacks as well (a workflow can have both)
-	return ms.processCloseCallbacksHsm()
+	return ms.processCloseCallbacksHsm(skipResultSubscriptions)
 }
 
 // processCloseCallbacksHsm triggers "WorkflowClosed" callbacks using the HSM implementation.
-func (ms *MutableStateImpl) processCloseCallbacksHsm() error {
+func (ms *MutableStateImpl) processCloseCallbacksHsm(skipResultSubscriptions bool) error {
 	coll := callbacks.MachineCollection(ms.HSM())
 	for _, node := range coll.List() {
 		cb, err := coll.Data(node.Key.ID)
@@ -7610,6 +7689,9 @@ func (ms *MutableStateImpl) processCloseCallbacksHsm() error {
 			continue
 		}
 		if cb.State() != enumsspb.CALLBACK_STATE_STANDBY {
+			continue
+		}
+		if skipResultSubscriptions && cb.GetCallback().GetResultSubscription() != nil {
 			continue
 		}
 		err = coll.Transition(node.Key.ID, func(cb callbacks.Callback) (hsm.TransitionOutput, error) {
@@ -7686,7 +7768,7 @@ func (ms *MutableStateImpl) cancelResultSubscriptionCallbacksHsm(cancelSet map[s
 }
 
 // processCloseCallbacksChasm triggers "WorkflowClosed" callbacks using the CHASM implementation.
-func (ms *MutableStateImpl) processCloseCallbacksChasm() error {
+func (ms *MutableStateImpl) processCloseCallbacksChasm(skipResultSubscriptions bool) error {
 	wf, _, err := ms.ChasmWorkflowComponentReadOnly(context.Background())
 	if err != nil {
 		return err
@@ -7703,7 +7785,7 @@ func (ms *MutableStateImpl) processCloseCallbacksChasm() error {
 		return err
 	}
 
-	return wf.ProcessCloseCallbacks(ctx)
+	return wf.ProcessCloseCallbacks(ctx, skipResultSubscriptions)
 }
 
 func (ms *MutableStateImpl) AddTasks(

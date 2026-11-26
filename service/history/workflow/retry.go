@@ -189,11 +189,19 @@ func SetupNewWorkflowForRetryOrCron(
 	runTimeout := startAttr.GetWorkflowRunTimeout()
 
 	var completionCallbacks []*commonpb.Callback
-	if initiator == enumspb.CONTINUE_AS_NEW_INITIATOR_RETRY {
-		completionCallbacks, err = getCompletionCallbacksAsProtoSlice(ctx, previousMutableState)
+	switch initiator {
+	case enumspb.CONTINUE_AS_NEW_INITIATOR_RETRY:
+		completionCallbacks, err = getCompletionCallbacksAsProtoSlice(ctx, previousMutableState, false)
 		if err != nil {
 			return err
 		}
+	case enumspb.CONTINUE_AS_NEW_INITIATOR_CRON_SCHEDULE:
+		completionCallbacks, err = getCompletionCallbacksAsProtoSlice(ctx, previousMutableState, true)
+		if err != nil {
+			return err
+		}
+	default:
+		// Other initiators do not carry completion callbacks through this path.
 	}
 
 	var pinnedOverride *workflowpb.VersioningOverride

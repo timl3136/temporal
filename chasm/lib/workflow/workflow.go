@@ -7,6 +7,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/chasm/lib/callback"
+	callbackspb "go.temporal.io/server/chasm/lib/callback/gen/callbackpb/v1"
 	"go.temporal.io/server/chasm/lib/nexusoperation"
 	chasmworkflowpb "go.temporal.io/server/chasm/lib/workflow/gen/workflowpb/v1"
 	"go.temporal.io/server/common/callbacks"
@@ -91,9 +92,21 @@ func (w *Workflow) Terminate(
 }
 
 // ProcessCloseCallbacks triggers "WorkflowClosed" callbacks using the CHASM implementation.
-// It schedules all workflow-level and update-level callbacks that are in STANDBY state.
-func (w *Workflow) ProcessCloseCallbacks(ctx chasm.MutableContext) error {
-	if err := callback.ScheduleCompletionCallbacks(ctx, w); err != nil {
+// It schedules workflow-level and update-level callbacks that are in STANDBY state.
+// When skipResultSubscriptions is true (the close has a successor run, such as cron), result
+// subscription callbacks remain in STANDBY so the successor run inherits them.
+func (w *Workflow) ProcessCloseCallbacks(ctx chasm.MutableContext, skipResultSubscriptions bool) error {
+	if skipResultSubscriptions {
+		for _, field := range w.Callbacks {
+			cb := field.Get(ctx)
+			if cb.Status != callbackspb.CALLBACK_STATUS_STANDBY || cb.GetCallback().GetResultSubscription() != nil {
+				continue
+			}
+			if err := callback.TransitionScheduled.Apply(cb, ctx, callback.EventScheduled{}); err != nil {
+				return err
+			}
+		}
+	} else if err := callback.ScheduleCompletionCallbacks(ctx, w); err != nil {
 		return err
 	}
 	return w.ProcessAllUpdateCloseCallbacks(ctx)
