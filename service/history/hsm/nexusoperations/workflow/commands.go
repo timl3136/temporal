@@ -386,6 +386,7 @@ func (ch *commandHandler) HandleCancelCommand(
 	if err := nexusoperations.RecordCanceled(node, commonnexus.ResultSubscriptionCanceledFailure()); err != nil {
 		return err
 	}
+	// shortcut: emitted before the workflow task commits (like executeOperationTimeout), so a retried task can over-count; plumb a post-commit hook if this counter needs to be exact.
 	nexusoperations.EmitOperationCanceled(ch.metricsHandler, ch.config, op, namespaceName, workflowType, closeTime)
 	return nil
 }
