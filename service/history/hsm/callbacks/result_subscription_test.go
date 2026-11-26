@@ -31,6 +31,7 @@ import (
 	"go.temporal.io/server/common/nexus/nexusrpc"
 	"go.temporal.io/server/common/testing/protorequire"
 	"go.temporal.io/server/common/testing/testlogger"
+	"go.temporal.io/server/service/history/consts"
 	"go.temporal.io/server/service/history/hsm"
 	"go.temporal.io/server/service/history/hsm/callbacks"
 	"go.temporal.io/server/service/history/hsm/hsmtest"
@@ -744,4 +745,198 @@ type hsmCompletionHandlerFunc func(context.Context, *nexusrpc.CompletionRequest)
 
 func (f hsmCompletionHandlerFunc) CompleteOperation(ctx context.Context, req *nexusrpc.CompletionRequest) error {
 	return f(ctx, req)
+}
+
+func TestResultSubscription_CancelTaskInvalidationAndStaleCaller(t *testing.T) {
+	t.Parallel()
+
+	subMeta := &commonpb.Callback_ResultSubscription{
+		RequestId:           "sub-req-1",
+		ResultFormatVersion: commoncallbacks.ResultSubscriptionFormatVersionV1,
+		ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "workflow-id", RunId: "origin-run"},
+	}
+
+	t.Run("queued invocation and backoff tasks are invalidated for canceled and succeeded callbacks", func(t *testing.T) {
+		t.Parallel()
+
+		reg := hsm.NewRegistry()
+		require.NoError(t, workflow.RegisterStateMachine(reg))
+		require.NoError(t, callbacks.RegisterStateMachine(reg))
+		root, err := hsm.NewRoot(reg, workflow.StateMachineType, &dualMutableState{}, make(map[string]*persistencespb.StateMachineMap), &hsmtest.NodeBackend{})
+		require.NoError(t, err)
+
+		coll := callbacks.MachineCollection(root)
+		canceledNode, err := coll.Add("sub-canceled", callbacks.NewCallback(
+			"attach-req-1",
+			nil,
+			callbacks.NewWorkflowClosedTrigger(),
+			&persistencespb.Callback{
+				Variant: &persistencespb.Callback_Nexus_{
+					Nexus: &persistencespb.Callback_Nexus{Url: commonnexus.SystemCallbackURL},
+				},
+				ResultSubscription: subMeta,
+			},
+		))
+		require.NoError(t, err)
+		require.NoError(t, callbacks.Cancel(coll, "sub-canceled"))
+
+		succeededNode, err := coll.Add("sub-succeeded", callbacks.Callback{
+			CallbackInfo: &persistencespb.CallbackInfo{
+				Trigger: callbacks.NewWorkflowClosedTrigger(),
+				Callback: &persistencespb.Callback{
+					Variant: &persistencespb.Callback_Nexus_{
+						Nexus: &persistencespb.Callback_Nexus{Url: commonnexus.SystemCallbackURL},
+					},
+					ResultSubscription: subMeta,
+				},
+				State:     enumsspb.CALLBACK_STATE_SUCCEEDED,
+				RequestId: "attach-req-2",
+			},
+		})
+		require.NoError(t, err)
+
+		for _, tc := range []struct {
+			name string
+			node *hsm.Node
+			id   string
+		}{
+			{name: "canceled", node: canceledNode, id: "sub-canceled"},
+			{name: "already_delivered", node: succeededNode, id: "sub-succeeded"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				require.ErrorIs(t, callbacks.NewInvocationTask(commonnexus.SystemCallbackURL).Validate(nil, tc.node), consts.ErrStaleReference)
+				require.ErrorIs(t, (callbacks.BackoffTask{}).Validate(nil, tc.node), consts.ErrStaleReference)
+
+				before, err := coll.Data(tc.id)
+				require.NoError(t, err)
+				_, err = callbacks.TransitionSucceeded.Apply(before, callbacks.EventSucceeded{Time: time.Now().UTC()})
+				require.ErrorIs(t, err, hsm.ErrInvalidTransition)
+			})
+		}
+	})
+
+	t.Run("stale caller NotFound and idempotent OK are terminal cleanup outcomes", func(t *testing.T) {
+		t.Parallel()
+
+		closeTime := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+		payload := &commonpb.Payload{
+			Metadata: map[string][]byte{"encoding": []byte("json/plain")},
+			Data:     []byte(`"ok"`),
+		}
+
+		for _, tc := range []struct {
+			name       string
+			handlerErr error
+			wantState  enumsspb.CallbackState
+		}{
+			{
+				name:       "stale_caller_not_found_fails_permanently_without_task_error",
+				handlerErr: nexus.NewHandlerErrorf(nexus.HandlerErrorTypeNotFound, "operation already canceled"),
+				wantState:  enumsspb.CALLBACK_STATE_FAILED,
+			},
+			{
+				name:       "idempotent_retry_delivery_succeeds",
+				handlerErr: nil,
+				wantState:  enumsspb.CALLBACK_STATE_SUCCEEDED,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				srv := httptest.NewServer(nexusrpc.NewCompletionHTTPHandler(nexusrpc.CompletionHandlerOptions{
+					Handler: hsmCompletionHandlerFunc(func(_ context.Context, _ *nexusrpc.CompletionRequest) error {
+						return tc.handlerErr
+					}),
+					Serializer: commonnexus.PayloadSerializer,
+				}))
+				defer srv.Close()
+
+				caller := func(req *http.Request) (*http.Response, error) {
+					rewritten := req.Clone(req.Context())
+					rewritten.URL.Scheme = "http"
+					rewritten.URL.Host = strings.TrimPrefix(srv.URL, "http://")
+					rewritten.Host = rewritten.URL.Host
+					return srv.Client().Do(rewritten)
+				}
+				updated, err := executeHSMCallbackTask(
+					t,
+					&dualMutableState{
+						subCompletion: nexusrpc.CompleteOperationOptions{
+							Result:    payload,
+							CloseTime: closeTime,
+						},
+					},
+					"sub",
+					callbacks.Callback{
+						CallbackInfo: &persistencespb.CallbackInfo{
+							Callback: &persistencespb.Callback{
+								Variant: &persistencespb.Callback_Nexus_{
+									Nexus: &persistencespb.Callback_Nexus{Url: commonnexus.SystemCallbackURL},
+								},
+								ResultSubscription: subMeta,
+							},
+							State:     enumsspb.CALLBACK_STATE_SCHEDULED,
+							RequestId: "attach-req-1",
+						},
+					},
+					commonnexus.SystemCallbackURL,
+					caller,
+					nil,
+					testlogger.NewTestLogger(t, testlogger.FailOnExpectedErrorOnly),
+				)
+				require.NoError(t, err)
+				require.Equal(t, tc.wantState, updated.State())
+			})
+		}
+	})
+
+	t.Run("internal CHASM stale caller NotFound transitions callback to FAILED", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		refBytes, err := (&persistencespb.ChasmComponentRef{
+			NamespaceId: "namespace-id",
+			BusinessId:  "caller-wf",
+			RunId:       "caller-run",
+			ArchetypeId: 1,
+		}).Marshal()
+		require.NoError(t, err)
+		encodedToken := base64.RawURLEncoding.EncodeToString(refBytes)
+
+		historyClient := historyservicemock.NewMockHistoryServiceClient(ctrl)
+		historyClient.EXPECT().CompleteNexusOperationChasm(gomock.Any(), gomock.Any()).Return(
+			nil, status.Error(codes.NotFound, "operation already canceled"),
+		)
+
+		updated, err := executeHSMCallbackTask(
+			t,
+			&dualMutableState{
+				subCompletion: nexusrpc.CompleteOperationOptions{
+					Result: &commonpb.Payload{Data: []byte("ok")},
+				},
+			},
+			"sub",
+			callbacks.Callback{
+				CallbackInfo: &persistencespb.CallbackInfo{
+					Callback: &persistencespb.Callback{
+						Variant: &persistencespb.Callback_Nexus_{
+							Nexus: &persistencespb.Callback_Nexus{
+								Url:    chasm.NexusCompletionHandlerURL,
+								Header: map[string]string{strings.ToLower(commonnexus.CallbackTokenHeader): encodedToken},
+							},
+						},
+						ResultSubscription: subMeta,
+					},
+					State:     enumsspb.CALLBACK_STATE_SCHEDULED,
+					RequestId: "attach-req-1",
+				},
+			},
+			chasm.NexusCompletionHandlerURL,
+			nil,
+			historyClient,
+			testlogger.NewTestLogger(t, testlogger.FailOnExpectedErrorOnly),
+		)
+		require.ErrorContains(t, err, "internal error, reference-id:")
+		require.Equal(t, enumsspb.CALLBACK_STATE_FAILED, updated.State())
+	})
 }

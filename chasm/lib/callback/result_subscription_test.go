@@ -847,3 +847,214 @@ type completionHandlerFunc func(context.Context, *nexusrpc.CompletionRequest) er
 func (f completionHandlerFunc) CompleteOperation(ctx context.Context, req *nexusrpc.CompletionRequest) error {
 	return f(ctx, req)
 }
+
+func TestResultSubscription_CancelTaskInvalidationAndStaleCaller(t *testing.T) {
+	t.Parallel()
+
+	subMeta := &commonpb.Callback_ResultSubscription{
+		RequestId:           "sub-req-1",
+		ResultFormatVersion: commoncallbacks.ResultSubscriptionFormatVersionV1,
+		ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "workflow-id", RunId: "origin-run"},
+	}
+
+	t.Run("queued invocation and backoff tasks are invalidated for canceled and succeeded callbacks", func(t *testing.T) {
+		t.Parallel()
+
+		invHandler := newInvocationTaskHandler(invocationTaskHandlerOptions{Logger: log.NewTestLogger()})
+		boHandler := newBackoffTaskHandler(backoffTaskHandlerOptions{})
+
+		canceledCB := &Callback{
+			CallbackState: &callbackspb.CallbackState{
+				RequestId: "attach-req-1",
+				Callback: &callbackspb.Callback{
+					Variant: &callbackspb.Callback_Nexus_{
+						Nexus: &callbackspb.Callback_Nexus{Url: commonnexus.SystemCallbackURL},
+					},
+					ResultSubscription: subMeta,
+				},
+				Status: callbackspb.CALLBACK_STATUS_STANDBY,
+			},
+		}
+		mctx := &chasm.MockMutableContext{}
+		require.NoError(t, TransitionCanceled.Apply(canceledCB, mctx, EventCanceled{}))
+
+		for _, tc := range []struct {
+			name string
+			cb   *Callback
+		}{
+			{name: "canceled", cb: canceledCB},
+			{
+				name: "already_delivered",
+				cb: &Callback{
+					CallbackState: &callbackspb.CallbackState{
+						RequestId: "attach-req-1",
+						Status:    callbackspb.CALLBACK_STATUS_SUCCEEDED,
+					},
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				valid, err := invHandler.Validate(nil, tc.cb, chasm.TaskInvocation{}, &callbackspb.InvocationTask{Attempt: tc.cb.Attempt})
+				require.NoError(t, err)
+				require.False(t, valid)
+
+				valid, err = boHandler.Validate(nil, tc.cb, chasm.TaskInvocation{}, &callbackspb.BackoffTask{Attempt: tc.cb.Attempt})
+				require.NoError(t, err)
+				require.False(t, valid)
+
+				// Late saveResult from an already-running attempt cannot resurrect or overwrite state.
+				beforeStatus := tc.cb.Status
+				beforeFailure := tc.cb.GetLastAttemptFailure()
+				_, err = tc.cb.saveResult(&chasm.MockMutableContext{}, saveResultInput{
+					result:      invocationResultOK{},
+					retryPolicy: backoff.NewExponentialRetryPolicy(time.Second),
+				})
+				require.ErrorIs(t, err, chasm.ErrInvalidTransition)
+				require.Equal(t, beforeStatus, tc.cb.Status)
+				protorequire.ProtoEqual(t, beforeFailure, tc.cb.GetLastAttemptFailure())
+			})
+		}
+	})
+
+	t.Run("stale caller NotFound and idempotent OK are terminal cleanup outcomes", func(t *testing.T) {
+		t.Parallel()
+
+		closeTime := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+		payload := &commonpb.Payload{
+			Metadata: map[string][]byte{"encoding": []byte("json/plain")},
+			Data:     []byte(`"ok"`),
+		}
+
+		for _, tc := range []struct {
+			name       string
+			handlerErr error
+			wantStatus callbackspb.CallbackStatus
+		}{
+			{
+				name:       "stale_caller_not_found_fails_permanently_without_task_error",
+				handlerErr: nexus.NewHandlerErrorf(nexus.HandlerErrorTypeNotFound, "operation already canceled"),
+				wantStatus: callbackspb.CALLBACK_STATUS_FAILED,
+			},
+			{
+				name:       "idempotent_retry_delivery_succeeds",
+				handlerErr: nil,
+				wantStatus: callbackspb.CALLBACK_STATUS_SUCCEEDED,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				srv := httptest.NewServer(nexusrpc.NewCompletionHTTPHandler(nexusrpc.CompletionHandlerOptions{
+					Handler: completionHandlerFunc(func(_ context.Context, _ *nexusrpc.CompletionRequest) error {
+						return tc.handlerErr
+					}),
+					Serializer: commonnexus.PayloadSerializer,
+				}))
+				defer srv.Close()
+
+				ns := test.NewNamespace(t)
+				caller := func(req *http.Request) (*http.Response, error) {
+					rewritten := req.Clone(req.Context())
+					rewritten.URL.Scheme = "http"
+					rewritten.URL.Host = strings.TrimPrefix(srv.URL, "http://")
+					rewritten.Host = rewritten.URL.Host
+					return srv.Client().Do(rewritten)
+				}
+				handler := newTestInvocationHandler(t, ns, testlogger.NewTestLogger(t, testlogger.FailOnExpectedErrorOnly), caller, nil)
+				engineCtx, refs := newDualCompletionTaskTest(
+					t,
+					handler,
+					&mockDualCompletionSource{
+						subCompletion: nexusrpc.CompleteOperationOptions{
+							Result:    payload,
+							CloseTime: closeTime,
+						},
+					},
+					map[string]*Callback{
+						"sub": {
+							CallbackState: &callbackspb.CallbackState{
+								RequestId: "attach-req-1",
+								Callback: &callbackspb.Callback{
+									Variant: &callbackspb.Callback_Nexus_{
+										Nexus: &callbackspb.Callback_Nexus{Url: commonnexus.SystemCallbackURL},
+									},
+									ResultSubscription: subMeta,
+								},
+								Status: callbackspb.CALLBACK_STATUS_SCHEDULED,
+							},
+						},
+					},
+				)
+				err := handler.Execute(
+					engineCtx,
+					refs["sub"],
+					chasm.TaskAttributes{Destination: commonnexus.SystemCallbackURL},
+					&callbackspb.InvocationTask{Attempt: 0},
+				)
+				require.NoError(t, err)
+				readCallbackState(engineCtx, t, refs["sub"], func(_ chasm.Context, got *Callback) {
+					require.Equal(t, tc.wantStatus, got.Status)
+				})
+			})
+		}
+	})
+
+	t.Run("internal CHASM stale caller NotFound transitions callback to FAILED", func(t *testing.T) {
+		t.Parallel()
+
+		ctrl := gomock.NewController(t)
+		refBytes, err := (&persistencespb.ChasmComponentRef{
+			NamespaceId: "namespace-id",
+			BusinessId:  "caller-wf",
+			RunId:       "caller-run",
+			ArchetypeId: 1,
+		}).Marshal()
+		require.NoError(t, err)
+		encodedToken := base64.RawURLEncoding.EncodeToString(refBytes)
+
+		historyClient := historyservicemock.NewMockHistoryServiceClient(ctrl)
+		historyClient.EXPECT().CompleteNexusOperationChasm(gomock.Any(), gomock.Any()).Return(
+			nil, serviceerror.NewNotFound("operation already canceled"),
+		)
+
+		ns := test.NewNamespace(t)
+		handler := newTestInvocationHandler(t, ns, testlogger.NewTestLogger(t, testlogger.FailOnExpectedErrorOnly), nil, historyClient)
+		engineCtx, refs := newDualCompletionTaskTest(
+			t,
+			handler,
+			&mockDualCompletionSource{
+				subCompletion: nexusrpc.CompleteOperationOptions{
+					Result: &commonpb.Payload{Data: []byte("ok")},
+				},
+			},
+			map[string]*Callback{
+				"sub": {
+					CallbackState: &callbackspb.CallbackState{
+						RequestId: "attach-req-1",
+						Callback: &callbackspb.Callback{
+							Variant: &callbackspb.Callback_Nexus_{
+								Nexus: &callbackspb.Callback_Nexus{
+									Url:    chasm.NexusCompletionHandlerURL,
+									Header: map[string]string{strings.ToLower(commonnexus.CallbackTokenHeader): encodedToken},
+								},
+							},
+							ResultSubscription: subMeta,
+						},
+						Status: callbackspb.CALLBACK_STATUS_SCHEDULED,
+					},
+				},
+			},
+		)
+		err = handler.Execute(
+			engineCtx,
+			refs["sub"],
+			chasm.TaskAttributes{Destination: chasm.NexusCompletionHandlerURL},
+			&callbackspb.InvocationTask{Attempt: 0},
+		)
+		require.ErrorContains(t, err, "internal error, reference-id:")
+		readCallbackState(engineCtx, t, refs["sub"], func(_ chasm.Context, got *Callback) {
+			require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, got.Status)
+		})
+	})
+}

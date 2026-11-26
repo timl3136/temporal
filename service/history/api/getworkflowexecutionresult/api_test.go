@@ -14,6 +14,7 @@ import (
 	commandpb "go.temporal.io/api/command/v1"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	failurepb "go.temporal.io/api/failure/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
@@ -82,6 +83,8 @@ type apiRun struct {
 	updateCalls  int
 	clearCalls   int
 	acquireCalls int
+	// initEvents tracks HistoryEvents committed during initial run creation.
+	initEvents []*historypb.HistoryEvent
 	// committedEvents tracks HistoryEvents produced on UpdateWorkflowExecutionAsActive.
 	committedEvents []*historypb.HistoryEvent
 }
@@ -485,12 +488,17 @@ func (e *apiTestEnv) addRealOpenRun(runID string, extraCallbacks ...*commonpb.Ca
 	require.NoError(e.t, err)
 	e.recordEvent(runID, completedEv)
 
-	_, _, err = ms.CloseTransactionAsSnapshot(e.t.Context(), historyi.TransactionPolicyActive)
+	_, initBatches, err := ms.CloseTransactionAsSnapshot(e.t.Context(), historyi.TransactionPolicyActive)
 	require.NoError(e.t, err)
+	var initEvents []*historypb.HistoryEvent
+	for _, b := range initBatches {
+		initEvents = append(initEvents, b.Events...)
+	}
 
 	run := &apiRun{
-		key: definition.NewWorkflowKey(e.namespaceID.String(), e.workflowID, runID),
-		ms:  ms,
+		key:        definition.NewWorkflowKey(e.namespaceID.String(), e.workflowID, runID),
+		ms:         ms,
+		initEvents: initEvents,
 	}
 	e.cache.addRun(run)
 	return run, ms, completedEv
@@ -2244,4 +2252,860 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 		env.cache.requireSingleRunLockAtATime(t)
 		env.cache.requireNoLeakedLocks(t)
 	})
+}
+
+func requireCallbackCountAndState(
+	t *testing.T,
+	ms *workflow.MutableStateImpl,
+	chasmMode bool,
+	wantCount int,
+	reqID string,
+	wantChasmStatus callbackspb.CallbackStatus,
+	wantHSMState enumsspb.CallbackState,
+	wantCanceledFailure bool,
+) {
+	t.Helper()
+	if chasmMode {
+		wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(t.Context())
+		require.NoError(t, err)
+		require.Len(t, wf.Callbacks, wantCount)
+		require.Equal(t, int64(wantCount), wf.GetCallbackMetadata().GetTotalCallbacksCount())
+		if reqID != "" {
+			cb, ok := wf.FindResultSubscription(ctx, reqID)
+			require.True(t, ok)
+			require.Equal(t, wantChasmStatus, cb.Status)
+			if wantCanceledFailure {
+				require.NotNil(t, cb.GetLastAttemptFailure().GetCanceledFailureInfo())
+			}
+		}
+		return
+	}
+	coll := hsmcallbacks.MachineCollection(ms.HSM())
+	require.Equal(t, wantCount, coll.Size())
+	if reqID != "" {
+		var found bool
+		for _, node := range coll.List() {
+			cb, err := coll.Data(node.Key.ID)
+			require.NoError(t, err)
+			if cb.GetCallback().GetResultSubscription().GetRequestId() == reqID {
+				found = true
+				require.Equal(t, wantHSMState, cb.State())
+				if wantCanceledFailure {
+					require.NotNil(t, cb.GetLastAttemptFailure().GetCanceledFailureInfo())
+				}
+			}
+		}
+		require.True(t, found, "expected HSM result subscription %s", reqID)
+	}
+}
+
+func (e *apiTestEnv) transitionViaRetryOrCron(
+	prevRunID string,
+	prevMS *workflow.MutableStateImpl,
+	initiator enumspb.ContinueAsNewInitiator,
+	closePrev func(nextRunID string) *historypb.HistoryEvent,
+) (*apiRun, *workflow.MutableStateImpl, *historypb.HistoryEvent) {
+	e.t.Helper()
+	nextRunID := uuid.NewString()
+	closeEv := closePrev(nextRunID)
+	e.recordEvent(prevRunID, closeEv)
+	_, _, err := prevMS.CloseTransactionAsMutation(e.t.Context(), historyi.TransactionPolicyActive)
+	require.NoError(e.t, err)
+
+	startEv, err := prevMS.GetStartEvent(e.t.Context())
+	require.NoError(e.t, err)
+
+	newMS, err := workflow.NewMutableStateInChain(
+		e.testShard,
+		e.testShard.MockEventsCache,
+		e.testShard.GetLogger(),
+		e.nsEntry,
+		e.workflowID,
+		nextRunID,
+		time.Now().UTC(),
+		prevMS,
+	)
+	require.NoError(e.t, err)
+	require.NoError(e.t, workflow.SetupNewWorkflowForRetryOrCron(
+		e.t.Context(),
+		prevMS,
+		newMS,
+		nextRunID,
+		startEv.GetWorkflowExecutionStartedEventAttributes(),
+		startEv.GetLinks(),
+		nil,
+		nil,
+		time.Second,
+		initiator,
+	))
+
+	tq := &taskqueuepb.TaskQueue{Name: "tq"}
+	wft, err := newMS.AddWorkflowTaskScheduledEvent(false, enumsspb.WORKFLOW_TASK_TYPE_NORMAL)
+	require.NoError(e.t, err)
+	_, wft, err = newMS.AddWorkflowTaskStartedEvent(wft.ScheduledEventID, "", tq, "", nil, nil, nil, false, nil, 0, "")
+	require.NoError(e.t, err)
+	completedEv, err := newMS.AddWorkflowTaskCompletedEvent(
+		wft,
+		&workflowservice.RespondWorkflowTaskCompletedRequest{},
+		historyi.WorkflowTaskCompletionLimits{MaxResetPoints: 10, MaxSearchAttributeValueSize: 1024},
+	)
+	require.NoError(e.t, err)
+	e.recordEvent(nextRunID, completedEv)
+	_, _, err = newMS.CloseTransactionAsSnapshot(e.t.Context(), historyi.TransactionPolicyActive)
+	require.NoError(e.t, err)
+
+	run := &apiRun{
+		key: definition.NewWorkflowKey(e.namespaceID.String(), e.workflowID, nextRunID),
+		ms:  newMS,
+	}
+	e.cache.addRun(run)
+	e.setCurrentRun(nextRunID)
+	return run, newMS, completedEv
+}
+
+func (e *apiTestEnv) evictAndReloadRun(run *apiRun, ms *workflow.MutableStateImpl) *workflow.MutableStateImpl {
+	e.t.Helper()
+	dbRecord := ms.CloneToProto()
+	reloaded, err := workflow.NewMutableStateFromDB(
+		e.testShard,
+		e.testShard.MockEventsCache,
+		e.testShard.GetLogger(),
+		e.nsEntry,
+		dbRecord,
+		1,
+	)
+	require.NoError(e.t, err)
+	require.NoError(e.t, reloaded.UpdateCurrentVersion(e.nsEntry.FailoverVersion(e.workflowID), true))
+	run.mu.Lock()
+	run.ms = reloaded
+	run.mu.Unlock()
+	return reloaded
+}
+
+func TestCancelCloseConcurrencyBothLockOrders(t *testing.T) {
+	t.Parallel()
+
+	for _, chasmMode := range []bool{true, false} {
+		modeName := "HSM"
+		if chasmMode {
+			modeName = "CHASM"
+		}
+
+		t.Run(modeName+"_cancel_wins_before_close", func(t *testing.T) {
+			t.Parallel()
+			env := newAPITestEnv(t, chasmMode)
+			runID := uuid.NewString()
+			run, ms, wftCompleted := env.addRealOpenRun(runID)
+			env.setCurrentRun(runID)
+
+			req1, req2 := uuid.NewString(), uuid.NewString()
+			caller1, caller2 := newCallerInfo(env.namespaceID, req1), newCallerInfo(env.namespaceID, req2)
+			sub1, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller1,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   req1,
+				Callback:    makeCallerCallback(t, caller1, req1, chasmMode),
+			})
+			require.NoError(t, err)
+			_, err = Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller2,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   req2,
+				Callback:    makeCallerCallback(t, caller2, req2, chasmMode),
+			})
+			require.NoError(t, err)
+
+			cancelInUpdate := make(chan struct{})
+			releaseCancel := make(chan struct{})
+			run.updateFn = func(ctx context.Context, m historyi.MutableState) error {
+				close(cancelInUpdate)
+				<-releaseCancel
+				_, batches, err := m.CloseTransactionAsMutation(ctx, historyi.TransactionPolicyActive)
+				if err != nil {
+					return err
+				}
+				run.mu.Lock()
+				for _, b := range batches {
+					run.committedEvents = append(run.committedEvents, b.Events...)
+				}
+				run.mu.Unlock()
+				return nil
+			}
+
+			cancelDone := make(chan error, 1)
+			go func() {
+				cancelDone <- Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller1, sub1.Subscribed.Token)
+			}()
+
+			<-cancelInUpdate
+
+			closeDone := make(chan error, 1)
+			go func() {
+				_, releaseFn, err := env.cache.GetOrCreateWorkflowExecution(
+					t.Context(),
+					env.testShard,
+					env.namespaceID,
+					&commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: runID},
+					locks.PriorityHigh,
+				)
+				if err != nil {
+					closeDone <- err
+					return
+				}
+				env.completeRun(runID, ms, wftCompleted.GetEventId(), []byte("closed-after-cancel"))
+				releaseFn(nil)
+				closeDone <- nil
+			}()
+
+			close(releaseCancel)
+			require.NoError(t, <-cancelDone)
+			require.NoError(t, <-closeDone)
+
+			// Waiter 1 stayed FAILED (canceled) with no delivery scheduled; waiter 2 was scheduled.
+			requireCallbackCountAndState(t, ms, chasmMode, 2, req1, callbackspb.CALLBACK_STATUS_FAILED, enumsspb.CALLBACK_STATE_FAILED, true)
+			requireCallbackCountAndState(t, ms, chasmMode, 2, req2, callbackspb.CALLBACK_STATUS_SCHEDULED, enumsspb.CALLBACK_STATE_SCHEDULED, false)
+			env.cache.requireSingleRunLockAtATime(t)
+			env.cache.requireNoLeakedLocks(t)
+		})
+
+		t.Run(modeName+"_close_wins_before_cancel", func(t *testing.T) {
+			t.Parallel()
+			env := newAPITestEnv(t, chasmMode)
+			runID := uuid.NewString()
+			run, ms, wftCompleted := env.addRealOpenRun(runID)
+			env.setCurrentRun(runID)
+
+			reqID := uuid.NewString()
+			caller := newCallerInfo(env.namespaceID, reqID)
+			sub, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   reqID,
+				Callback:    makeCallerCallback(t, caller, reqID, chasmMode),
+			})
+			require.NoError(t, err)
+			require.Equal(t, 1, run.updateCalls)
+
+			// Close holds the run lease first while Cancel waits for the same lease.
+			_, releaseClose, err := env.cache.GetOrCreateWorkflowExecution(
+				t.Context(),
+				env.testShard,
+				env.namespaceID,
+				&commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: runID},
+				locks.PriorityHigh,
+			)
+			require.NoError(t, err)
+
+			cancelDone := make(chan error, 1)
+			go func() {
+				cancelDone <- Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller, sub.Subscribed.Token)
+			}()
+
+			env.completeRun(runID, ms, wftCompleted.GetEventId(), []byte("closed-first"))
+			releaseClose(nil)
+
+			require.NoError(t, <-cancelDone)
+			require.Equal(t, 1, run.updateCalls, "Cancel after Close must be a no-op with zero writes")
+			requireCallbackCountAndState(t, ms, chasmMode, 1, reqID, callbackspb.CALLBACK_STATUS_SCHEDULED, enumsspb.CALLBACK_STATE_SCHEDULED, false)
+			env.cache.requireSingleRunLockAtATime(t)
+			env.cache.requireNoLeakedLocks(t)
+		})
+
+		t.Run(modeName+"_stale_cache_conflict_when_close_commits_concurrently", func(t *testing.T) {
+			t.Parallel()
+			env := newAPITestEnv(t, chasmMode)
+			runID := uuid.NewString()
+			staleRun, staleMS, wftCompleted := env.addRealOpenRun(runID)
+			env.setCurrentRun(runID)
+
+			reqID := uuid.NewString()
+			caller := newCallerInfo(env.namespaceID, reqID)
+			sub, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   reqID,
+				Callback:    makeCallerCallback(t, caller, reqID, chasmMode),
+			})
+			require.NoError(t, err)
+
+			// Snapshot before close and build a closed DB copy representing the concurrently committed close.
+			closedMS, err := workflow.NewMutableStateFromDB(
+				env.testShard, env.testShard.MockEventsCache, env.testShard.GetLogger(), env.nsEntry, staleMS.CloneToProto(), 1,
+			)
+			require.NoError(t, err)
+			require.NoError(t, closedMS.UpdateCurrentVersion(env.nsEntry.FailoverVersion(env.workflowID), true))
+			env.completeRun(runID, closedMS, wftCompleted.GetEventId(), []byte("concurrent-close"))
+
+			var cleared atomic.Bool
+			staleRun.loadFn = func(context.Context) (historyi.MutableState, error) {
+				if cleared.Load() {
+					return closedMS, nil
+				}
+				return staleMS, nil
+			}
+			staleRun.clearFn = func() { cleared.Store(true) }
+			staleRun.updateFn = func(context.Context, historyi.MutableState) error {
+				return &persistence.CurrentWorkflowConditionFailedError{Msg: "run closed concurrently", RunID: runID}
+			}
+
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller, sub.Subscribed.Token))
+			require.True(t, cleared.Load())
+			requireCallbackCountAndState(t, closedMS, chasmMode, 1, reqID, callbackspb.CALLBACK_STATUS_SCHEDULED, enumsspb.CALLBACK_STATE_SCHEDULED, false)
+			env.cache.requireSingleRunLockAtATime(t)
+			env.cache.requireNoLeakedLocks(t)
+		})
+
+		t.Run(modeName+"_concurrent_repeated_cancels_write_once", func(t *testing.T) {
+			t.Parallel()
+			env := newAPITestEnv(t, chasmMode)
+			runID := uuid.NewString()
+			run, ms, _ := env.addRealOpenRun(runID)
+			env.setCurrentRun(runID)
+
+			reqID := uuid.NewString()
+			caller := newCallerInfo(env.namespaceID, reqID)
+			sub, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   reqID,
+				Callback:    makeCallerCallback(t, caller, reqID, chasmMode),
+			})
+			require.NoError(t, err)
+			require.Equal(t, 1, run.updateCalls)
+
+			const workers = 16
+			errs := make(chan error, workers)
+			gate := make(chan struct{})
+			var wg sync.WaitGroup
+			for range workers {
+				wg.Go(func() {
+					<-gate
+					errs <- Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller, sub.Subscribed.Token)
+				})
+			}
+			close(gate)
+			wg.Wait()
+			close(errs)
+
+			for err := range errs {
+				require.NoError(t, err)
+			}
+			require.Equal(t, 2, run.updateCalls, "concurrent repeated Cancels must commit exactly one cancel event")
+			requireCallbackCountAndState(t, ms, chasmMode, 1, reqID, callbackspb.CALLBACK_STATUS_FAILED, enumsspb.CALLBACK_STATE_FAILED, true)
+			env.cache.requireSingleRunLockAtATime(t)
+			env.cache.requireNoLeakedLocks(t)
+		})
+
+		t.Run(modeName+"_already_delivered_cancel_noop_and_DEC2_late_attach", func(t *testing.T) {
+			t.Parallel()
+			env := newAPITestEnv(t, chasmMode)
+			run1ID := uuid.NewString()
+			run1, ms1, wft1 := env.addRealOpenRun(run1ID)
+			env.setCurrentRun(run1ID)
+
+			reqDelivered := uuid.NewString()
+			callerDelivered := newCallerInfo(env.namespaceID, reqDelivered)
+			subDelivered, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      callerDelivered,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   reqDelivered,
+				Callback:    makeCallerCallback(t, callerDelivered, reqDelivered, chasmMode),
+			})
+			require.NoError(t, err)
+
+			// Close run1 and mark callback SUCCEEDED (already delivered).
+			env.completeRun(run1ID, ms1, wft1.GetEventId(), []byte("done"))
+			if chasmMode {
+				wf, writeCtx, err := ms1.ChasmWorkflowComponent(t.Context())
+				require.NoError(t, err)
+				cb, ok := wf.FindResultSubscription(writeCtx, reqDelivered)
+				require.True(t, ok)
+				require.NoError(t, chasmcallback.TransitionSucceeded.Apply(cb, writeCtx, chasmcallback.EventSucceeded{Time: time.Now().UTC()}))
+			} else {
+				coll := hsmcallbacks.MachineCollection(ms1.HSM())
+				//nolint:staticcheck // SA1019: HSM callbacks remain supported alongside CHASM.
+				require.NoError(t, coll.Transition("cb-"+reqDelivered+"-0", func(cb hsmcallbacks.Callback) (hsm.TransitionOutput, error) {
+					return hsmcallbacks.TransitionSucceeded.Apply(cb, hsmcallbacks.EventSucceeded{Time: time.Now().UTC()})
+				}))
+			}
+			updatesBefore := run1.updateCalls
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, callerDelivered, subDelivered.Subscribed.Token))
+			require.Equal(t, updatesBefore, run1.updateCalls)
+			requireCallbackCountAndState(t, ms1, chasmMode, 1, reqDelivered, callbackspb.CALLBACK_STATUS_SUCCEEDED, enumsspb.CALLBACK_STATE_SUCCEEDED, false)
+
+			// DEC-2: on a new open chain, explicit cancel followed by same-run Start dedup does not resurrect,
+			// and after CAN drops the canceled callback (DEC-8, no tombstones) a late Start is allowed once.
+			run2ID := uuid.NewString()
+			run2, ms2, wft2 := env.addRealOpenRun(run2ID)
+			env.setCurrentRun(run2ID)
+			reqLate := uuid.NewString()
+			callerLate := newCallerInfo(env.namespaceID, reqLate)
+			cbLate := makeCallerCallback(t, callerLate, reqLate, chasmMode)
+			subLate, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      callerLate,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   reqLate,
+				Callback:    cbLate,
+			})
+			require.NoError(t, err)
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, callerLate, subLate.Subscribed.Token))
+
+			// Same-run Start retry returns original token without resurrecting the canceled callback.
+			dupSameRun, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      callerLate,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   reqLate,
+				Callback:    cbLate,
+			})
+			require.NoError(t, err)
+			require.Equal(t, subLate.Subscribed.Token, dupSameRun.Subscribed.Token)
+			require.Equal(t, 2, run2.updateCalls)
+			requireCallbackCountAndState(t, ms2, chasmMode, 1, reqLate, callbackspb.CALLBACK_STATUS_FAILED, enumsspb.CALLBACK_STATE_FAILED, true)
+
+			// CAN drops canceled callback (DEC-8, no tombstones); a late Start on the new run is allowed once (DEC-2).
+			run3, ms3, _ := env.continueAsNewRun(run2ID, ms2, wft2.GetEventId())
+			requireCallbackCountAndState(t, ms3, chasmMode, 0, "", 0, 0, false)
+			lateAttach, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      callerLate,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   reqLate,
+				Callback:    cbLate,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, lateAttach.Subscribed)
+			require.Equal(t, 1, run3.updateCalls)
+			requireCallbackCountAndState(t, ms3, chasmMode, 1, reqLate, callbackspb.CALLBACK_STATUS_STANDBY, enumsspb.CALLBACK_STATE_STANDBY, false)
+			env.cache.requireNoLeakedLocks(t)
+		})
+	}
+}
+
+func TestLifecycleAcrossCronRetryCacheEvictionResetAndFailover(t *testing.T) {
+	t.Parallel()
+
+	for _, chasmMode := range []bool{true, false} {
+		modeName := "HSM"
+		if chasmMode {
+			modeName = "CHASM"
+		}
+
+		t.Run(modeName+"_cron_and_retry_carry_over_stable_token_and_DEC8", func(t *testing.T) {
+			t.Parallel()
+			env := newAPITestEnv(t, chasmMode)
+			legacyCB := &commonpb.Callback{
+				Variant: &commonpb.Callback_Nexus_{
+					Nexus: &commonpb.Callback_Nexus{Url: "http://legacy.example/cb"},
+				},
+			}
+			run1ID := uuid.NewString()
+			_, ms1, wft1 := env.addRealOpenRun(run1ID, legacyCB)
+			env.setCurrentRun(run1ID)
+
+			req1, req2 := uuid.NewString(), uuid.NewString()
+			caller1, caller2 := newCallerInfo(env.namespaceID, req1), newCallerInfo(env.namespaceID, req2)
+			cb1 := makeCallerCallback(t, caller1, req1, chasmMode)
+			cb2 := makeCallerCallback(t, caller2, req2, chasmMode)
+
+			sub1, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller1,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   req1,
+				Callback:    cb1,
+			})
+			require.NoError(t, err)
+			sub2, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller2,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   req2,
+				Callback:    cb2,
+			})
+			require.NoError(t, err)
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller2, sub2.Subscribed.Token))
+
+			// 1. Cron completion: run1 -> run2. Legacy fires on run1 & is not copied; sub2 (canceled) is not copied (DEC-8);
+			//    sub1 stays STANDBY on run1 & is carried to run2.
+			_, ms2, wft2 := env.transitionViaRetryOrCron(run1ID, ms1, enumspb.CONTINUE_AS_NEW_INITIATOR_CRON_SCHEDULE, func(nextRunID string) *historypb.HistoryEvent {
+				ev, err := ms1.AddCompletedWorkflowEvent(wft1.GetEventId(), &commandpb.CompleteWorkflowExecutionCommandAttributes{}, nextRunID)
+				require.NoError(t, err)
+				return ev
+			})
+			requireCallbackCountAndState(t, ms1, chasmMode, 3, req1, callbackspb.CALLBACK_STATUS_STANDBY, enumsspb.CALLBACK_STATE_STANDBY, false)
+			requireCallbackCountAndState(t, ms1, chasmMode, 3, req2, callbackspb.CALLBACK_STATUS_FAILED, enumsspb.CALLBACK_STATE_FAILED, true)
+			requireCallbackCountAndState(t, ms2, chasmMode, 1, req1, callbackspb.CALLBACK_STATUS_STANDBY, enumsspb.CALLBACK_STATE_STANDBY, false)
+
+			// 2. Retry on failure (RETRY_STATE_IN_PROGRESS): run2 -> run3.
+			_, ms3, wft3 := env.transitionViaRetryOrCron(ms2.GetExecutionState().GetRunId(), ms2, enumspb.CONTINUE_AS_NEW_INITIATOR_RETRY, func(nextRunID string) *historypb.HistoryEvent {
+				ev, err := ms2.AddFailWorkflowEvent(
+					wft2.GetEventId(),
+					enumspb.RETRY_STATE_IN_PROGRESS,
+					&commandpb.FailWorkflowExecutionCommandAttributes{Failure: &failurepb.Failure{Message: "retryable"}},
+					nextRunID,
+				)
+				require.NoError(t, err)
+				return ev
+			})
+			requireCallbackCountAndState(t, ms3, chasmMode, 1, req1, callbackspb.CALLBACK_STATUS_STANDBY, enumsspb.CALLBACK_STATE_STANDBY, false)
+
+			// 3. Cron failure (no retry): run3 -> run4.
+			_, ms4, _ := env.transitionViaRetryOrCron(ms3.GetExecutionState().GetRunId(), ms3, enumspb.CONTINUE_AS_NEW_INITIATOR_CRON_SCHEDULE, func(nextRunID string) *historypb.HistoryEvent {
+				ev, err := ms3.AddFailWorkflowEvent(
+					wft3.GetEventId(),
+					enumspb.RETRY_STATE_RETRY_POLICY_NOT_SET,
+					&commandpb.FailWorkflowExecutionCommandAttributes{Failure: &failurepb.Failure{Message: "cron fail"}},
+					nextRunID,
+				)
+				require.NoError(t, err)
+				return ev
+			})
+			requireCallbackCountAndState(t, ms4, chasmMode, 1, req1, callbackspb.CALLBACK_STATUS_STANDBY, enumsspb.CALLBACK_STATE_STANDBY, false)
+
+			// 4. Cron timeout (no retry): run4 -> run5.
+			run5, ms5, _ := env.transitionViaRetryOrCron(ms4.GetExecutionState().GetRunId(), ms4, enumspb.CONTINUE_AS_NEW_INITIATOR_CRON_SCHEDULE, func(nextRunID string) *historypb.HistoryEvent {
+				ev, err := ms4.AddTimeoutWorkflowEvent(enumspb.RETRY_STATE_TIMEOUT, nextRunID)
+				require.NoError(t, err)
+				return ev
+			})
+			requireCallbackCountAndState(t, ms5, chasmMode, 1, req1, callbackspb.CALLBACK_STATUS_STANDBY, enumsspb.CALLBACK_STATE_STANDBY, false)
+
+			// Verify original metadata preserved on run5.
+			stored, found, err := findResultSubscription(t.Context(), ms5, req1)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, int32(1), stored.sub.GetResultFormatVersion())
+			protorequire.ProtoEqual(t, &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: run1ID}, stored.sub.GetResolvedExecution())
+
+			// Start dedup (unpinned and pinned to run1) returns the exact original token with zero writes.
+			for _, targetRunID := range []string{"", run1ID} {
+				dup, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+					NamespaceID: env.namespaceID,
+					Caller:      caller1,
+					Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: targetRunID},
+					RequestID:   req1,
+					Callback:    cb1,
+				})
+				require.NoError(t, err)
+				require.Equal(t, sub1.Subscribed.Token, dup.Subscribed.Token)
+				protorequire.ProtoEqual(t, sub1.Subscribed.Link, dup.Subscribed.Link)
+				require.Zero(t, run5.updateCalls)
+			}
+
+			// Repeated Cancel of dropped sub2 is a no-op with zero writes.
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller2, sub2.Subscribed.Token))
+			require.Zero(t, run5.updateCalls)
+
+			// Cancel of sub1 with the original run1 token finds and cancels it on run5.
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller1, sub1.Subscribed.Token))
+			require.Equal(t, 1, run5.updateCalls)
+			requireCallbackCountAndState(t, ms5, chasmMode, 1, req1, callbackspb.CALLBACK_STATUS_FAILED, enumsspb.CALLBACK_STATE_FAILED, true)
+			env.cache.requireSingleRunLockAtATime(t)
+			env.cache.requireNoLeakedLocks(t)
+		})
+
+		t.Run(modeName+"_cache_eviction_reload_preserves_token_and_cancel", func(t *testing.T) {
+			t.Parallel()
+			env := newAPITestEnv(t, chasmMode)
+			runID := uuid.NewString()
+			run, ms, _ := env.addRealOpenRun(runID)
+			env.setCurrentRun(runID)
+
+			req1, req2 := uuid.NewString(), uuid.NewString()
+			caller1, caller2 := newCallerInfo(env.namespaceID, req1), newCallerInfo(env.namespaceID, req2)
+			cb1 := makeCallerCallback(t, caller1, req1, chasmMode)
+			cb2 := makeCallerCallback(t, caller2, req2, chasmMode)
+
+			sub1, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller1,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   req1,
+				Callback:    cb1,
+			})
+			require.NoError(t, err)
+			sub2, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller2,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   req2,
+				Callback:    cb2,
+			})
+			require.NoError(t, err)
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller2, sub2.Subscribed.Token))
+			require.Equal(t, 3, run.updateCalls)
+
+			// Simulate mutable-state cache eviction and reload from persistence.
+			reloaded := env.evictAndReloadRun(run, ms)
+
+			// Dedup and repeated cancel work against the reloaded mutable state with zero writes.
+			dup, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller1,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   req1,
+				Callback:    cb1,
+			})
+			require.NoError(t, err)
+			require.Equal(t, sub1.Subscribed.Token, dup.Subscribed.Token)
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller2, sub2.Subscribed.Token))
+			require.Equal(t, 3, run.updateCalls)
+
+			// Cancel sub1 after eviction, then evict and reload again to confirm persisted disposition.
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller1, sub1.Subscribed.Token))
+			require.Equal(t, 4, run.updateCalls)
+			reloaded2 := env.evictAndReloadRun(run, reloaded)
+
+			requireCallbackCountAndState(t, reloaded2, chasmMode, 2, req1, callbackspb.CALLBACK_STATUS_FAILED, enumsspb.CALLBACK_STATE_FAILED, true)
+			requireCallbackCountAndState(t, reloaded2, chasmMode, 2, req2, callbackspb.CALLBACK_STATUS_FAILED, enumsspb.CALLBACK_STATE_FAILED, true)
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller1, sub1.Subscribed.Token))
+			require.Equal(t, 4, run.updateCalls)
+			env.cache.requireNoLeakedLocks(t)
+		})
+
+		t.Run(modeName+"_reset_reapply_preserves_token_and_blocks_resurrection", func(t *testing.T) {
+			t.Parallel()
+			env := newAPITestEnv(t, chasmMode)
+			baseRunID := uuid.NewString()
+			baseRun, baseMS, _ := env.addRealOpenRun(baseRunID)
+			env.setCurrentRun(baseRunID)
+
+			req1, req2 := uuid.NewString(), uuid.NewString()
+			caller1, caller2 := newCallerInfo(env.namespaceID, req1), newCallerInfo(env.namespaceID, req2)
+			cb1 := makeCallerCallback(t, caller1, req1, chasmMode)
+			cb2 := makeCallerCallback(t, caller2, req2, chasmMode)
+
+			sub1, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller1,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   req1,
+				Callback:    cb1,
+			})
+			require.NoError(t, err)
+			sub2, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+				NamespaceID: env.namespaceID,
+				Caller:      caller2,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
+				RequestID:   req2,
+				Callback:    cb2,
+			})
+			require.NoError(t, err)
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller2, sub2.Subscribed.Token))
+
+			// Rebuild reset run from baseRun's start event and reapply post-reset attach/cancel events
+			// (plus a duplicate old attach for canceled sub2 to confirm no resurrection).
+			resetRunID := uuid.NewString()
+			startEv, err := baseMS.GetStartEvent(t.Context())
+			require.NoError(t, err)
+			resetMS := workflow.NewMutableState(
+				env.testShard, env.testShard.MockEventsCache, env.testShard.GetLogger(), env.nsEntry, env.workflowID, resetRunID, time.Now().UTC(),
+			)
+			rebuilder := workflow.NewMutableStateRebuilder(env.testShard, env.testShard.GetLogger(), resetMS)
+			_, err = rebuilder.ApplyEvents(
+				t.Context(),
+				env.namespaceID,
+				"reset-req",
+				&commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: resetRunID},
+				[][]*historypb.HistoryEvent{{startEv}},
+				nil,
+				"",
+			)
+			require.NoError(t, err)
+			require.NoError(t, resetMS.UpdateCurrentVersion(env.nsEntry.FailoverVersion(env.workflowID), true))
+			for _, ev := range baseRun.committedEvents {
+				_, err = resetMS.AddWorkflowExecutionOptionsUpdatedEventWithAttributes(
+					ev.GetWorkflowExecutionOptionsUpdatedEventAttributes(), ev.GetLinks(),
+				)
+				require.NoError(t, err)
+			}
+			// Replaying the old attach event for canceled sub2 must not resurrect it.
+			require.NoError(t, resetMS.ApplyWorkflowExecutionOptionsUpdatedEvent(baseRun.committedEvents[1]))
+			_, _, err = resetMS.CloseTransactionAsSnapshot(t.Context(), historyi.TransactionPolicyActive)
+			require.NoError(t, err)
+
+			// Mark base run as reset -> resetRunID and register resetRun as current.
+			baseMS.UpdateResetRunID(resetRunID)
+			baseMS.GetExecutionInfo().WorkflowWasReset = true
+			require.NoError(t, workflow.TerminateWorkflow(baseMS, "reset", nil, "history-service", false, nil))
+			_, _, err = baseMS.CloseTransactionAsMutation(t.Context(), historyi.TransactionPolicyActive)
+			require.NoError(t, err)
+
+			resetRun := &apiRun{
+				key: definition.NewWorkflowKey(env.namespaceID.String(), env.workflowID, resetRunID),
+				ms:  resetMS,
+			}
+			env.cache.addRun(resetRun)
+			env.setCurrentRun(resetRunID)
+
+			// Verify 2 callbacks (sub1 STANDBY, sub2 FAILED-canceled), original token stable via pinned & unpinned Start.
+			requireCallbackCountAndState(t, resetMS, chasmMode, 2, req1, callbackspb.CALLBACK_STATUS_STANDBY, enumsspb.CALLBACK_STATE_STANDBY, false)
+			requireCallbackCountAndState(t, resetMS, chasmMode, 2, req2, callbackspb.CALLBACK_STATUS_FAILED, enumsspb.CALLBACK_STATE_FAILED, true)
+			for _, targetRunID := range []string{"", baseRunID} {
+				dup, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
+					NamespaceID: env.namespaceID,
+					Caller:      caller1,
+					Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: targetRunID},
+					RequestID:   req1,
+					Callback:    cb1,
+				})
+				require.NoError(t, err)
+				require.Equal(t, sub1.Subscribed.Token, dup.Subscribed.Token)
+				require.Zero(t, resetRun.updateCalls)
+			}
+
+			// Cancel sub1 with original token succeeds on reset run; Cancel sub2 is a no-op.
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller2, sub2.Subscribed.Token))
+			require.Zero(t, resetRun.updateCalls)
+			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller1, sub1.Subscribed.Token))
+			require.Equal(t, 1, resetRun.updateCalls)
+			requireCallbackCountAndState(t, resetMS, chasmMode, 2, req1, callbackspb.CALLBACK_STATUS_FAILED, enumsspb.CALLBACK_STATE_FAILED, true)
+			env.cache.requireSingleRunLockAtATime(t)
+			env.cache.requireNoLeakedLocks(t)
+		})
+
+		t.Run(modeName+"_replication_and_failover_preserves_token_and_cancel", func(t *testing.T) {
+			t.Parallel()
+			activeEnv := newAPITestEnv(t, chasmMode)
+			run1ID := uuid.NewString()
+			run1, ms1, wft1 := activeEnv.addRealOpenRun(run1ID)
+			activeEnv.setCurrentRun(run1ID)
+
+			req1, req2 := uuid.NewString(), uuid.NewString()
+			caller1, caller2 := newCallerInfo(activeEnv.namespaceID, req1), newCallerInfo(activeEnv.namespaceID, req2)
+			cb1 := makeCallerCallback(t, caller1, req1, chasmMode)
+			cb2 := makeCallerCallback(t, caller2, req2, chasmMode)
+
+			sub1, err := Start(t.Context(), activeEnv.testShard, activeEnv.checker, StartRequest{
+				NamespaceID: activeEnv.namespaceID,
+				Caller:      caller1,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: activeEnv.workflowID},
+				RequestID:   req1,
+				Callback:    cb1,
+			})
+			require.NoError(t, err)
+			sub2, err := Start(t.Context(), activeEnv.testShard, activeEnv.checker, StartRequest{
+				NamespaceID: activeEnv.namespaceID,
+				Caller:      caller2,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: activeEnv.workflowID},
+				RequestID:   req2,
+				Callback:    cb2,
+			})
+			require.NoError(t, err)
+			require.NoError(t, Cancel(t.Context(), activeEnv.testShard, activeEnv.checker, activeEnv.namespaceID, caller2, sub2.Subscribed.Token))
+
+			// Cron close run1 -> run2 and capture full histories of both runs for replication.
+			run2ID := uuid.NewString()
+			start1Ev, err := ms1.GetStartEvent(t.Context())
+			require.NoError(t, err)
+			close1Ev, err := ms1.AddCompletedWorkflowEvent(wft1.GetEventId(), &commandpb.CompleteWorkflowExecutionCommandAttributes{}, run2ID)
+			require.NoError(t, err)
+			_, _, err = ms1.CloseTransactionAsMutation(t.Context(), historyi.TransactionPolicyActive)
+			require.NoError(t, err)
+
+			ms2Active, err := workflow.NewMutableStateInChain(
+				activeEnv.testShard, activeEnv.testShard.MockEventsCache, activeEnv.testShard.GetLogger(),
+				activeEnv.nsEntry, activeEnv.workflowID, run2ID, time.Now().UTC(), ms1,
+			)
+			require.NoError(t, err)
+			require.NoError(t, workflow.SetupNewWorkflowForRetryOrCron(
+				t.Context(), ms1, ms2Active, run2ID,
+				start1Ev.GetWorkflowExecutionStartedEventAttributes(), start1Ev.GetLinks(), nil, nil,
+				time.Second, enumspb.CONTINUE_AS_NEW_INITIATOR_CRON_SCHEDULE,
+			))
+			_, run2Batches, err := ms2Active.CloseTransactionAsSnapshot(t.Context(), historyi.TransactionPolicyActive)
+			require.NoError(t, err)
+
+			var run1ReplEvents []*historypb.HistoryEvent
+			run1ReplEvents = append(run1ReplEvents, run1.initEvents...)
+			run1ReplEvents = append(run1ReplEvents, run1.committedEvents...)
+			run1ReplEvents = append(run1ReplEvents, close1Ev)
+			var run2ReplEvents []*historypb.HistoryEvent
+			for _, b := range run2Batches {
+				run2ReplEvents = append(run2ReplEvents, b.Events...)
+			}
+
+			// Replicate onto a separate cluster environment (standby -> promoted active on failover).
+			failoverEnv := newAPITestEnv(t, chasmMode)
+			failoverEnv.workflowID = activeEnv.workflowID
+			standbyRun1 := workflow.NewMutableState(
+				failoverEnv.testShard, failoverEnv.testShard.MockEventsCache, failoverEnv.testShard.GetLogger(),
+				failoverEnv.nsEntry, failoverEnv.workflowID, run1ID, time.Now().UTC(),
+			)
+			rebuilder := workflow.NewMutableStateRebuilder(failoverEnv.testShard, failoverEnv.testShard.GetLogger(), standbyRun1)
+			var run1EventBatches [][]*historypb.HistoryEvent
+			for _, ev := range run1ReplEvents {
+				run1EventBatches = append(run1EventBatches, []*historypb.HistoryEvent{ev})
+			}
+			replicatedRun2Iface, err := rebuilder.ApplyEvents(
+				t.Context(),
+				failoverEnv.namespaceID,
+				"repl-start-req",
+				&commonpb.WorkflowExecution{WorkflowId: failoverEnv.workflowID, RunId: run1ID},
+				run1EventBatches,
+				run2ReplEvents,
+				run2ID,
+			)
+			require.NoError(t, err)
+			replicatedRun2, ok := replicatedRun2Iface.(*workflow.MutableStateImpl)
+			require.True(t, ok)
+			snap2, _, err := replicatedRun2.CloseTransactionAsSnapshot(t.Context(), historyi.TransactionPolicyPassive)
+			require.NoError(t, err)
+			promotedRun2, err := workflow.NewMutableStateFromDB(
+				failoverEnv.testShard, failoverEnv.testShard.MockEventsCache, failoverEnv.testShard.GetLogger(),
+				failoverEnv.nsEntry,
+				&persistencespb.WorkflowMutableState{
+					ExecutionInfo:  common.CloneProto(snap2.ExecutionInfo),
+					ExecutionState: common.CloneProto(snap2.ExecutionState),
+					NextEventId:    snap2.NextEventID,
+					ChasmNodes:     snap2.ChasmNodes,
+					Checksum:       snap2.Checksum,
+				},
+				1,
+			)
+			require.NoError(t, err)
+			require.NoError(t, promotedRun2.UpdateCurrentVersion(failoverEnv.nsEntry.FailoverVersion(failoverEnv.workflowID), true))
+
+			// Register replicated runs in failover cluster cache (simulating failover promotion).
+			failoverEnv.cache.addRun(&apiRun{
+				key: definition.NewWorkflowKey(failoverEnv.namespaceID.String(), failoverEnv.workflowID, run1ID),
+				ms:  standbyRun1,
+			})
+			failoverRun2 := &apiRun{
+				key: definition.NewWorkflowKey(failoverEnv.namespaceID.String(), failoverEnv.workflowID, run2ID),
+				ms:  promotedRun2,
+			}
+			failoverEnv.cache.addRun(failoverRun2)
+			failoverEnv.setCurrentRun(run2ID)
+
+			// Post-failover: run2 has exactly 1 callback (sub1), original metadata, and stable token.
+			requireCallbackCountAndState(t, promotedRun2, chasmMode, 1, req1, callbackspb.CALLBACK_STATUS_STANDBY, enumsspb.CALLBACK_STATE_STANDBY, false)
+			dupAfterFailover, err := Start(t.Context(), failoverEnv.testShard, failoverEnv.checker, StartRequest{
+				NamespaceID: failoverEnv.namespaceID,
+				Caller:      caller1,
+				Target:      &commonpb.WorkflowExecution{WorkflowId: failoverEnv.workflowID, RunId: run1ID},
+				RequestID:   req1,
+				Callback:    cb1,
+			})
+			require.NoError(t, err)
+			require.Equal(t, sub1.Subscribed.Token, dupAfterFailover.Subscribed.Token)
+			require.Zero(t, failoverRun2.updateCalls)
+
+			// Post-failover Cancel with original token cancels sub1 on run2; replaying old attach cannot resurrect.
+			require.NoError(t, Cancel(t.Context(), failoverEnv.testShard, failoverEnv.checker, failoverEnv.namespaceID, caller1, sub1.Subscribed.Token))
+			require.Equal(t, 1, failoverRun2.updateCalls)
+			require.NoError(t, promotedRun2.ApplyWorkflowExecutionOptionsUpdatedEvent(run1.committedEvents[0]))
+			requireCallbackCountAndState(t, promotedRun2, chasmMode, 1, req1, callbackspb.CALLBACK_STATUS_FAILED, enumsspb.CALLBACK_STATE_FAILED, true)
+			failoverEnv.cache.requireSingleRunLockAtATime(t)
+			failoverEnv.cache.requireNoLeakedLocks(t)
+		})
+	}
 }
