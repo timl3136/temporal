@@ -237,7 +237,7 @@ func TestReapplyEvents_ResultSubscriptionCancelSurvivesReset(t *testing.T) {
 
 		wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(t.Context())
 		require.NoError(t, err)
-		_, cb, ok := wf.FindResultSubscription(ctx, "sub-req-1")
+		cb, ok := wf.FindResultSubscription(ctx, "sub-req-1")
 		require.True(t, ok)
 		require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, cb.Status)
 		require.NotNil(t, cb.GetLastAttemptFailure().GetCanceledFailureInfo())
@@ -273,7 +273,7 @@ func TestReapplyEvents_ResultSubscriptionCancelSurvivesReset(t *testing.T) {
 
 		wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(t.Context())
 		require.NoError(t, err)
-		_, cb, ok := wf.FindResultSubscription(ctx, "sub-req-1")
+		cb, ok := wf.FindResultSubscription(ctx, "sub-req-1")
 		require.True(t, ok)
 		require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, cb.Status)
 		require.NotNil(t, cb.GetLastAttemptFailure().GetCanceledFailureInfo())

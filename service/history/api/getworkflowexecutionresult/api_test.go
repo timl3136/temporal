@@ -859,7 +859,6 @@ func TestStartFreshOpenAttachAndClosedRead(t *testing.T) {
 			stored, found, err := findResultSubscription(t.Context(), ms, reqID)
 			require.NoError(t, err)
 			require.True(t, found)
-			require.Equal(t, mode.chasmCallbacks, stored.isChasm)
 			require.True(t, stored.cancelable)
 
 			env.cache.requireSingleRunLockAtATime(t)
@@ -1555,7 +1554,7 @@ func TestStartCloseRacingAttachBothLockOrders(t *testing.T) {
 
 		wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(t.Context())
 		require.NoError(t, err)
-		_, storedCB, ok := wf.FindResultSubscription(ctx, reqID)
+		storedCB, ok := wf.FindResultSubscription(ctx, reqID)
 		require.True(t, ok)
 		require.Equal(t, callbackspb.CALLBACK_STATUS_SCHEDULED, storedCB.Status)
 		env.cache.requireSingleRunLockAtATime(t)
@@ -1919,7 +1918,7 @@ func TestCancelTokenAndCallerValidation(t *testing.T) {
 	require.Equal(t, 1, run.updateCalls)
 	wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(t.Context())
 	require.NoError(t, err)
-	_, cb, ok := wf.FindResultSubscription(ctx, reqID)
+	cb, ok := wf.FindResultSubscription(ctx, reqID)
 	require.True(t, ok)
 	require.Equal(t, callbackspb.CALLBACK_STATUS_STANDBY, cb.Status)
 	env.cache.requireNoLeakedLocks(t)
@@ -1992,11 +1991,11 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 			if chasmMode {
 				wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(t.Context())
 				require.NoError(t, err)
-				_, cb1, ok := wf.FindResultSubscription(ctx, req1)
+				cb1, ok := wf.FindResultSubscription(ctx, req1)
 				require.True(t, ok)
 				require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, cb1.Status)
 				require.NotNil(t, cb1.GetLastAttemptFailure().GetCanceledFailureInfo())
-				_, cb2, ok := wf.FindResultSubscription(ctx, req2)
+				cb2, ok := wf.FindResultSubscription(ctx, req2)
 				require.True(t, ok)
 				require.Equal(t, callbackspb.CALLBACK_STATUS_SCHEDULED, cb2.Status)
 			} else {
@@ -2092,7 +2091,7 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 		require.Equal(t, 1, r2Run.updateCalls, "unrelated reuse R2 must not be mutated")
 		r2WF, r2Ctx, err := r2MS.ChasmWorkflowComponentReadOnly(t.Context())
 		require.NoError(t, err)
-		_, r2CB, ok := r2WF.FindResultSubscription(r2Ctx, req2)
+		r2CB, ok := r2WF.FindResultSubscription(r2Ctx, req2)
 		require.True(t, ok)
 		require.Equal(t, callbackspb.CALLBACK_STATUS_STANDBY, r2CB.Status)
 
@@ -2238,7 +2237,7 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 
 		c2WF, c2Ctx, err := c2MS.ChasmWorkflowComponentReadOnly(t.Context())
 		require.NoError(t, err)
-		_, cb, ok := c2WF.FindResultSubscription(c2Ctx, reqID)
+		cb, ok := c2WF.FindResultSubscription(c2Ctx, reqID)
 		require.True(t, ok)
 		require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, cb.Status)
 		require.NotNil(t, cb.GetLastAttemptFailure().GetCanceledFailureInfo())

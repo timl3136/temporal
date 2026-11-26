@@ -362,24 +362,23 @@ func TestResultSubscriptionLookupAndCancel(t *testing.T) {
 	require.Equal(t, int64(3), initialCount)
 
 	// FindResultSubscription resolves inherited subscription by ResultSubscription.RequestId.
-	key1, cb1, ok := wf.FindResultSubscription(ctx, "sub-req-1")
+	cb1, ok := wf.FindResultSubscription(ctx, "sub-req-1")
 	require.True(t, ok)
-	require.Equal(t, "can-req-id-0", key1)
 	require.Equal(t, "sub-req-1", cb1.GetCallback().GetResultSubscription().GetRequestId())
 
 	// Non-result callback is not returned even when querying by its attach request ID.
-	_, _, ok = wf.FindResultSubscription(ctx, "can-req-id")
+	_, ok = wf.FindResultSubscription(ctx, "can-req-id")
 	require.False(t, ok)
 
 	// Cancel only sub-req-1; sub-req-2 and legacy stay in STANDBY, metadata totals remain unchanged.
 	cancelSet := map[string]struct{}{"sub-req-1": {}, "missing-req": {}}
 	keys := wf.CancelableResultSubscriptionKeys(ctx, cancelSet)
-	require.Equal(t, []string{key1}, keys)
+	require.Equal(t, []string{"can-req-id-0"}, keys)
 	require.NoError(t, wf.CancelResultSubscriptions(ctx, keys))
 
-	require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, wf.Callbacks[key1].Get(ctx).Status)
-	require.NotNil(t, wf.Callbacks[key1].Get(ctx).GetLastAttemptFailure().GetCanceledFailureInfo())
-	_, cb2, ok := wf.FindResultSubscription(ctx, "sub-req-2")
+	require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, wf.Callbacks["can-req-id-0"].Get(ctx).Status)
+	require.NotNil(t, wf.Callbacks["can-req-id-0"].Get(ctx).GetLastAttemptFailure().GetCanceledFailureInfo())
+	cb2, ok := wf.FindResultSubscription(ctx, "sub-req-2")
 	require.True(t, ok)
 	require.Equal(t, callbackspb.CALLBACK_STATUS_STANDBY, cb2.Status)
 	require.Equal(t, callbackspb.CALLBACK_STATUS_STANDBY, wf.Callbacks["can-req-id-1"].Get(ctx).Status)

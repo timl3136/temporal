@@ -521,7 +521,6 @@ func readChainSuccessor(
 }
 
 type storedSubscription struct {
-	isChasm    bool
 	sub        *commonpb.Callback_ResultSubscription
 	url        string
 	header     map[string]string
@@ -541,9 +540,8 @@ func findResultSubscription(
 		if err != nil {
 			return storedSubscription{}, false, err
 		}
-		if _, cb, ok := wf.FindResultSubscription(readCtx, requestID); ok {
+		if cb, ok := wf.FindResultSubscription(readCtx, requestID); ok {
 			return storedSubscription{
-				isChasm:    true,
 				sub:        cb.GetCallback().GetResultSubscription(),
 				url:        cb.GetCallback().GetNexus().GetUrl(),
 				header:     cb.GetCallback().GetNexus().GetHeader(),
@@ -561,7 +559,6 @@ func findResultSubscription(
 			sub := cb.GetCallback().GetResultSubscription()
 			if sub != nil && sub.GetRequestId() == requestID {
 				return storedSubscription{
-					isChasm:    false,
 					sub:        sub,
 					url:        cb.GetCallback().GetNexus().GetUrl(),
 					header:     cb.GetCallback().GetNexus().GetHeader(),

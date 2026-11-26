@@ -33,25 +33,24 @@ func (w *Workflow) GetNexusCompletion(
 	return w.MSPointer.GetNexusCompletion(ctx, requestID)
 }
 
-// FindResultSubscription returns the CHASM map key and callback whose ResultSubscription
-// matches requestID.
+// FindResultSubscription returns the callback whose ResultSubscription matches requestID.
 func (w *Workflow) FindResultSubscription(
 	ctx chasm.Context,
 	requestID string,
-) (string, *callback.Callback, bool) {
+) (*callback.Callback, bool) {
 	if requestID == "" {
-		return "", nil, false
+		return nil, false
 	}
-	for key, field := range w.Callbacks {
+	for _, field := range w.Callbacks {
 		cb, ok := field.TryGet(ctx)
 		if !ok {
 			continue
 		}
 		if cb.GetCallback().GetResultSubscription().GetRequestId() == requestID {
-			return key, cb, true
+			return cb, true
 		}
 	}
-	return "", nil, false
+	return nil, false
 }
 
 // CancelableResultSubscriptionKeys returns the CHASM map keys of callbacks whose
