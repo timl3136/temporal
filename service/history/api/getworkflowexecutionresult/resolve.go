@@ -9,6 +9,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/serviceerror"
+	enumsspb "go.temporal.io/server/api/enums/v1"
 	"go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/definition"
@@ -17,9 +18,15 @@ import (
 	"go.temporal.io/server/service/history/api"
 	"go.temporal.io/server/service/history/consts"
 	historyi "go.temporal.io/server/service/history/interfaces"
+	"go.temporal.io/server/service/history/ndc"
 )
 
-const maxStaleCurrentRunAttempts = 5
+const (
+	maxStaleCurrentRunAttempts = 5
+	maxChainWalkHops           = 100
+)
+
+var errDifferentChain = errors.New("target workflow execution belongs to a different execution chain")
 
 type resolveRequest struct {
 	namespaceID namespace.ID
@@ -38,6 +45,13 @@ type resolvedTarget struct {
 // resolveActionFunc runs under the resolved target's workflow lease.
 // When target.closeEvent is non-nil, the target is closed and no persistence write is performed.
 type resolveActionFunc func(lease api.WorkflowLease, target resolvedTarget) (*api.UpdateWorkflowAction, error)
+
+type resolveStep struct {
+	target     resolvedTarget
+	follow     bool
+	firstRunID string
+	nextRunID  string
+}
 
 // resolveTarget resolves req.target under its workflow lease and invokes action if non-nil.
 // It returns either the resolved open execution (with its chain's first run ID) or a cloned
@@ -88,115 +102,31 @@ func resolveExplicitRun(
 	req resolveRequest,
 	action resolveActionFunc,
 ) (resolvedTarget, error) {
-	var lastErr error
-	for range maxStaleCurrentRunAttempts {
-		if err := ctx.Err(); err != nil {
-			return resolvedTarget{}, err
-		}
-		resolved, followFirstRunID, err := resolveExplicitRunOnce(ctx, shard, checker, req, action)
-		if err != nil {
-			if isStaleCurrentRunError(err) {
-				lastErr = err
-				continue
-			}
-			return resolvedTarget{}, err
-		}
-		if followFirstRunID != "" {
-			// The requested run's lease has been released before acquiring the current run's lease.
-			return resolveCurrent(ctx, shard, checker, req, followFirstRunID, action)
-		}
-		return resolved, nil
-	}
-	return resolvedTarget{}, lastErr
-}
-
-func resolveExplicitRunOnce(
-	ctx context.Context,
-	shard historyi.ShardContext,
-	checker api.WorkflowConsistencyChecker,
-	req resolveRequest,
-	action resolveActionFunc,
-) (resolvedTarget, string, error) {
-	var (
-		resolved         resolvedTarget
-		followFirstRunID string
-		cleanErr         error
-	)
 	workflowKey := definition.NewWorkflowKey(
 		req.namespaceID.String(),
 		req.target.GetWorkflowId(),
 		req.target.GetRunId(),
 	)
-	err := api.GetAndUpdateWorkflowWithNew(
-		ctx,
-		nil,
-		workflowKey,
-		func(lease api.WorkflowLease) (*api.UpdateWorkflowAction, error) {
-			ms := lease.GetMutableState()
-			actualKey, err := resolvedWorkflowKey(req.namespaceID, req.target.GetWorkflowId(), lease)
-			if err != nil {
-				cleanErr = err
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
-
-			firstRunID, err := ms.GetFirstRunID(ctx)
-			if err != nil {
-				cleanErr = err
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
-
-			if ms.IsWorkflowExecutionRunning() {
-				if isSelfWait(req.caller, actualKey, firstRunID) {
-					cleanErr = newSelfWaitError()
-					return &api.UpdateWorkflowAction{Noop: true}, nil
-				}
-				if firstRunID == "" {
-					cleanErr = serviceerror.NewInternal("workflow execution is missing first execution run ID")
-					return &api.UpdateWorkflowAction{Noop: true}, nil
-				}
-				resolved = resolvedTarget{
-					workflowKey: actualKey,
-					firstRunID:  firstRunID,
-				}
-				return runOpenAction(lease, resolved, action)
-			}
-
-			closeEvent, superseded, err := readTerminalCloseEvent(ctx, ms)
-			if err != nil {
-				cleanErr = err
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
-			if superseded {
-				if firstRunID == "" {
-					cleanErr = newDifferentChainError()
-					return &api.UpdateWorkflowAction{Noop: true}, nil
-				}
-				followFirstRunID = firstRunID
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
-
-			if isSelfWait(req.caller, actualKey, firstRunID) {
-				cleanErr = newSelfWaitError()
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
-			resolved = resolvedTarget{
-				workflowKey: actualKey,
-				firstRunID:  firstRunID,
-				closeEvent:  closeEvent,
-			}
-			return runClosedAction(lease, resolved, action)
-		},
-		nil,
-		shard,
-		checker,
-	)
+	step, err := resolveRunWithRetry(ctx, shard, checker, req, workflowKey, "", true, action)
 	if err != nil {
-		return resolvedTarget{}, "", err
+		return resolvedTarget{}, err
 	}
-	if cleanErr != nil {
-		return resolvedTarget{}, "", cleanErr
+	if !step.follow {
+		return step.target, nil
 	}
-	return resolved, followFirstRunID, nil
+	// The requested run's lease has been released before acquiring the current run's lease.
+	if step.firstRunID != "" {
+		resolved, err := resolveCurrent(ctx, shard, checker, req, step.firstRunID, action)
+		if err == nil {
+			return resolved, nil
+		}
+		_, isNotFound := errors.AsType[*serviceerror.NotFound](err)
+		if !errors.Is(err, errDifferentChain) && !isNotFound {
+			return resolvedTarget{}, err
+		}
+	}
+	// Current run belongs to a different chain (or is absent); walk forward from the requested run.
+	return walkChain(ctx, shard, checker, req, workflowKey.RunID, step.nextRunID, action)
 }
 
 func resolveCurrent(
@@ -207,40 +137,98 @@ func resolveCurrent(
 	expectedFirstRunID string,
 	action resolveActionFunc,
 ) (resolvedTarget, error) {
+	workflowKey := definition.NewWorkflowKey(
+		req.namespaceID.String(),
+		req.target.GetWorkflowId(),
+		"",
+	)
+	step, err := resolveRunWithRetry(ctx, shard, checker, req, workflowKey, expectedFirstRunID, false, action)
+	if err != nil {
+		return resolvedTarget{}, err
+	}
+	return step.target, nil
+}
+
+func walkChain(
+	ctx context.Context,
+	shard historyi.ShardContext,
+	checker api.WorkflowConsistencyChecker,
+	req resolveRequest,
+	startRunID string,
+	nextRunID string,
+	action resolveActionFunc,
+) (resolvedTarget, error) {
+	visited := map[string]struct{}{startRunID: {}}
+	for range maxChainWalkHops {
+		if nextRunID == "" {
+			return resolvedTarget{}, serviceerror.NewFailedPrecondition("target workflow execution chain is broken: missing successor run")
+		}
+		if _, seen := visited[nextRunID]; seen {
+			return resolvedTarget{}, serviceerror.NewFailedPrecondition("target workflow execution chain contains a cycle")
+		}
+		visited[nextRunID] = struct{}{}
+
+		hopKey := definition.NewWorkflowKey(
+			req.namespaceID.String(),
+			req.target.GetWorkflowId(),
+			nextRunID,
+		)
+		step, err := resolveRunWithRetry(ctx, shard, checker, req, hopKey, "", true, action)
+		if err != nil {
+			if _, ok := errors.AsType[*serviceerror.NotFound](err); ok {
+				return resolvedTarget{}, serviceerror.NewFailedPrecondition("target workflow execution chain is broken: successor run not found")
+			}
+			return resolvedTarget{}, err
+		}
+		if !step.follow {
+			return step.target, nil
+		}
+		nextRunID = step.nextRunID
+	}
+	return resolvedTarget{}, serviceerror.NewFailedPrecondition("target workflow execution chain exceeded maximum walk hops")
+}
+
+func resolveRunWithRetry(
+	ctx context.Context,
+	shard historyi.ShardContext,
+	checker api.WorkflowConsistencyChecker,
+	req resolveRequest,
+	workflowKey definition.WorkflowKey,
+	expectedFirstRunID string,
+	explicit bool,
+	action resolveActionFunc,
+) (resolveStep, error) {
 	var lastErr error
 	for range maxStaleCurrentRunAttempts {
 		if err := ctx.Err(); err != nil {
-			return resolvedTarget{}, err
+			return resolveStep{}, err
 		}
-		resolved, err := resolveCurrentOnce(ctx, shard, checker, req, expectedFirstRunID, action)
+		step, err := resolveOnce(ctx, shard, checker, req, workflowKey, expectedFirstRunID, explicit, action)
 		if err != nil {
 			if isStaleCurrentRunError(err) {
 				lastErr = err
 				continue
 			}
-			return resolvedTarget{}, err
+			return resolveStep{}, err
 		}
-		return resolved, nil
+		return step, nil
 	}
-	return resolvedTarget{}, lastErr
+	return resolveStep{}, lastErr
 }
 
-func resolveCurrentOnce(
+func resolveOnce(
 	ctx context.Context,
 	shard historyi.ShardContext,
 	checker api.WorkflowConsistencyChecker,
 	req resolveRequest,
+	workflowKey definition.WorkflowKey,
 	expectedFirstRunID string,
+	explicit bool,
 	action resolveActionFunc,
-) (resolvedTarget, error) {
+) (resolveStep, error) {
 	var (
-		resolved resolvedTarget
+		step     resolveStep
 		cleanErr error
-	)
-	workflowKey := definition.NewWorkflowKey(
-		req.namespaceID.String(),
-		req.target.GetWorkflowId(),
-		"",
 	)
 	err := api.GetAndUpdateWorkflowWithNew(
 		ctx,
@@ -253,29 +241,23 @@ func resolveCurrentOnce(
 				cleanErr = err
 				return &api.UpdateWorkflowAction{Noop: true}, nil
 			}
+			if ms.GetExecutionState().GetState() == enumsspb.WORKFLOW_EXECUTION_STATE_ZOMBIE {
+				cleanErr = serviceerror.NewFailedPrecondition("target workflow execution is in zombie state")
+				return &api.UpdateWorkflowAction{Noop: true}, nil
+			}
 
-			var firstRunID string
-			if expectedFirstRunID != "" {
-				firstRunID, err = ms.GetFirstRunID(ctx)
-				if err != nil {
-					cleanErr = err
-					return &api.UpdateWorkflowAction{Noop: true}, nil
-				}
-				if firstRunID == "" || firstRunID != expectedFirstRunID {
-					cleanErr = newDifferentChainError()
-					return &api.UpdateWorkflowAction{Noop: true}, nil
-				}
+			firstRunID, err := ms.GetFirstRunID(ctx)
+			if err != nil {
+				cleanErr = err
+				return &api.UpdateWorkflowAction{Noop: true}, nil
+			}
+			if expectedFirstRunID != "" && (firstRunID == "" || firstRunID != expectedFirstRunID) {
+				cleanErr = errDifferentChain
+				return &api.UpdateWorkflowAction{Noop: true}, nil
 			}
 
 			if ms.IsWorkflowExecutionRunning() {
-				if expectedFirstRunID == "" {
-					firstRunID, err = ms.GetFirstRunID(ctx)
-					if err != nil {
-						cleanErr = err
-						return &api.UpdateWorkflowAction{Noop: true}, nil
-					}
-				}
-				if isSelfWait(req.caller, actualKey, firstRunID) {
+				if isSelfWait(req.caller, actualKey) {
 					cleanErr = newSelfWaitError()
 					return &api.UpdateWorkflowAction{Noop: true}, nil
 				}
@@ -283,79 +265,82 @@ func resolveCurrentOnce(
 					cleanErr = serviceerror.NewInternal("workflow execution is missing first execution run ID")
 					return &api.UpdateWorkflowAction{Noop: true}, nil
 				}
-				resolved = resolvedTarget{
+				step.target = resolvedTarget{
 					workflowKey: actualKey,
 					firstRunID:  firstRunID,
 				}
-				return runOpenAction(lease, resolved, action)
+				return runResolvedAction(lease, step.target, false, action)
 			}
 
-			closeEvent, superseded, err := readTerminalCloseEvent(ctx, ms)
+			closeEvent, nextRunID, superseded, err := readTerminalCloseEvent(ctx, ms, explicit)
 			if err != nil {
 				cleanErr = err
 				return &api.UpdateWorkflowAction{Noop: true}, nil
 			}
 			if superseded {
+				if explicit {
+					step.follow = true
+					step.firstRunID = firstRunID
+					step.nextRunID = nextRunID
+					return &api.UpdateWorkflowAction{Noop: true}, nil
+				}
 				cleanErr = consts.ErrLocateCurrentWorkflowExecution
 				return &api.UpdateWorkflowAction{Noop: true}, nil
 			}
 
-			if expectedFirstRunID == "" {
-				firstRunID, err = ms.GetFirstRunID(ctx)
-				if err != nil {
-					cleanErr = err
-					return &api.UpdateWorkflowAction{Noop: true}, nil
-				}
-			}
-			if isSelfWait(req.caller, actualKey, firstRunID) {
+			if isSelfWait(req.caller, actualKey) {
 				cleanErr = newSelfWaitError()
 				return &api.UpdateWorkflowAction{Noop: true}, nil
 			}
-			resolved = resolvedTarget{
+			step.target = resolvedTarget{
 				workflowKey: actualKey,
 				firstRunID:  firstRunID,
 				closeEvent:  closeEvent,
 			}
-			return runClosedAction(lease, resolved, action)
+			return runResolvedAction(lease, step.target, true, action)
 		},
 		nil,
 		shard,
 		checker,
 	)
 	if err != nil {
-		return resolvedTarget{}, err
+		return resolveStep{}, err
 	}
 	if cleanErr != nil {
-		return resolvedTarget{}, cleanErr
+		return resolveStep{}, cleanErr
 	}
-	return resolved, nil
+	return step, nil
 }
 
 // readTerminalCloseEvent returns a cloned terminal close event for a closed run,
-// or superseded=true if the run has a chain successor.
+// or superseded=true (with nextRunID when known) if the run has a chain successor.
+// When followReset is false (the run is already confirmed current), reset markers
+// are treated as final rather than superseded.
 func readTerminalCloseEvent(
 	ctx context.Context,
 	ms historyi.MutableState,
-) (*historypb.HistoryEvent, bool, error) {
-	if hasMutableStateSuccessor(ms) {
-		return nil, true, nil
+	followReset bool,
+) (*historypb.HistoryEvent, string, bool, error) {
+	if nextRunID, ok := mutableStateSuccessor(ms, followReset); ok {
+		return nil, nextRunID, true, nil
 	}
 	completionEvent, err := ms.GetCompletionEvent(ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	if completionEvent == nil {
-		return nil, false, serviceerror.NewInternal("missing workflow completion event")
+		return nil, "", false, serviceerror.NewInternal("missing workflow completion event")
 	}
-	if hasCompletionEventSuccessor(completionEvent) {
-		return nil, true, nil
+	if nextRunID, ok := completionEventSuccessor(completionEvent, followReset); ok {
+		return nil, nextRunID, true, nil
 	}
-	return common.CloneProto(completionEvent), false, nil
+	return common.CloneProto(completionEvent), "", false, nil
 }
 
-func runOpenAction(
+func runResolvedAction(
 	lease api.WorkflowLease,
 	resolved resolvedTarget,
+	closed bool,
 	action resolveActionFunc,
 ) (*api.UpdateWorkflowAction, error) {
 	if action == nil {
@@ -365,28 +350,13 @@ func runOpenAction(
 	if err != nil {
 		return nil, err
 	}
-	if postActions == nil {
+	if closed && postActions != nil && !postActions.Noop {
+		return nil, serviceerror.NewInternal("closed workflow execution cannot be mutated")
+	}
+	if closed || postActions == nil {
 		return &api.UpdateWorkflowAction{Noop: true}, nil
 	}
 	return postActions, nil
-}
-
-func runClosedAction(
-	lease api.WorkflowLease,
-	resolved resolvedTarget,
-	action resolveActionFunc,
-) (*api.UpdateWorkflowAction, error) {
-	if action == nil {
-		return &api.UpdateWorkflowAction{Noop: true}, nil
-	}
-	postActions, err := action(lease, resolved)
-	if err != nil {
-		return nil, err
-	}
-	if postActions != nil && !postActions.Noop {
-		return nil, serviceerror.NewInternal("closed workflow execution cannot be mutated")
-	}
-	return &api.UpdateWorkflowAction{Noop: true}, nil
 }
 
 func resolvedWorkflowKey(
@@ -404,52 +374,55 @@ func resolvedWorkflowKey(
 	return definition.NewWorkflowKey(namespaceID.String(), workflowID, runID), nil
 }
 
-func hasMutableStateSuccessor(ms historyi.MutableState) bool {
+func mutableStateSuccessor(ms historyi.MutableState, followReset bool) (string, bool) {
 	info := ms.GetExecutionInfo()
-	state := ms.GetExecutionState()
-	runID := state.GetRunId()
-	if info.GetNewExecutionRunId() != "" {
-		return true
+	runID := ms.GetExecutionState().GetRunId()
+	if followReset {
+		if resetRunID := info.GetResetRunId(); resetRunID != "" && resetRunID != runID {
+			return resetRunID, true
+		}
 	}
-	if state.GetStatus() == enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW {
-		return true
+	if newRunID := info.GetNewExecutionRunId(); newRunID != "" && newRunID != runID {
+		return newRunID, true
 	}
-	if info.GetWorkflowWasReset() {
-		return true
+	if followReset && info.GetWorkflowWasReset() {
+		return "", true
 	}
-	if resetRunID := info.GetResetRunId(); resetRunID != "" && resetRunID != runID {
-		return true
-	}
-	return false
+	return "", false
 }
 
-func hasCompletionEventSuccessor(event *historypb.HistoryEvent) bool {
+func completionEventSuccessor(event *historypb.HistoryEvent, followReset bool) (string, bool) {
 	switch event.GetEventType() {
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW:
-		return true
+		return event.GetWorkflowExecutionContinuedAsNewEventAttributes().GetNewExecutionRunId(), true
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED:
-		return event.GetWorkflowExecutionCompletedEventAttributes().GetNewExecutionRunId() != ""
+		if newRunID := event.GetWorkflowExecutionCompletedEventAttributes().GetNewExecutionRunId(); newRunID != "" {
+			return newRunID, true
+		}
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED:
-		return event.GetWorkflowExecutionFailedEventAttributes().GetNewExecutionRunId() != ""
+		if newRunID := event.GetWorkflowExecutionFailedEventAttributes().GetNewExecutionRunId(); newRunID != "" {
+			return newRunID, true
+		}
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TIMED_OUT:
-		return event.GetWorkflowExecutionTimedOutEventAttributes().GetNewExecutionRunId() != ""
+		if newRunID := event.GetWorkflowExecutionTimedOutEventAttributes().GetNewExecutionRunId(); newRunID != "" {
+			return newRunID, true
+		}
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED:
-		return event.GetWorkflowExecutionTerminatedEventAttributes().GetIdentity() == consts.IdentityResetter
+		if followReset && ndc.IsTerminatedByResetter(event) {
+			return "", true
+		}
 	default:
-		return false
 	}
+	return "", false
 }
 
 func isSelfWait(
 	caller *historyservice.NexusCallerInfo,
 	resolvedKey definition.WorkflowKey,
-	firstRunID string,
 ) bool {
-	if caller.GetNamespaceId() != resolvedKey.NamespaceID || caller.GetWorkflowId() != resolvedKey.WorkflowID {
-		return false
-	}
-	return resolvedKey.RunID == caller.GetRunId() ||
-		(firstRunID != "" && firstRunID == caller.GetRunId())
+	return caller.GetNamespaceId() == resolvedKey.NamespaceID &&
+		caller.GetWorkflowId() == resolvedKey.WorkflowID &&
+		caller.GetRunId() == resolvedKey.RunID
 }
 
 func isStaleCurrentRunError(err error) bool {
@@ -462,8 +435,4 @@ func isStaleCurrentRunError(err error) bool {
 
 func newSelfWaitError() error {
 	return serviceerror.NewInvalidArgument("workflow execution cannot await its own result")
-}
-
-func newDifferentChainError() error {
-	return serviceerror.NewFailedPrecondition("target workflow execution belongs to a different execution chain")
 }

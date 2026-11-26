@@ -289,7 +289,7 @@ func newResolveTestEnv(t *testing.T) *resolveTestEnv {
 	}
 
 	mockShard.EXPECT().GetCurrentExecution(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, req *persistence.GetCurrentExecutionRequest) (*persistence.GetCurrentExecutionResponse, error) {
+		func(_ context.Context, _ *persistence.GetCurrentExecutionRequest) (*persistence.GetCurrentExecutionResponse, error) {
 			env.mu.Lock()
 			defer env.mu.Unlock()
 			var resp currentExecutionResponse
@@ -327,6 +327,7 @@ type mockRunSpec struct {
 	firstRunID        string
 	firstRunIDErr     error
 	running           bool
+	state             enumsspb.WorkflowExecutionState
 	status            enumspb.WorkflowExecutionStatus
 	newExecutionRunID string
 	resetRunID        string
@@ -351,12 +352,16 @@ func (e *resolveTestEnv) addMockRun(spec mockRunSpec) *fakeRun {
 func (e *resolveTestEnv) newMockMutableState(spec mockRunSpec) *historyi.MockMutableState {
 	ms := historyi.NewMockMutableState(e.ctrl)
 	status := spec.status
-	state := enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED
-	if spec.running {
-		state = enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING
-		if status == enumspb.WORKFLOW_EXECUTION_STATUS_UNSPECIFIED {
-			status = enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING
+	state := spec.state
+	if state == enumsspb.WORKFLOW_EXECUTION_STATE_UNSPECIFIED {
+		if spec.running {
+			state = enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING
+		} else {
+			state = enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED
 		}
+	}
+	if spec.running && status == enumspb.WORKFLOW_EXECUTION_STATUS_UNSPECIFIED {
+		status = enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING
 	}
 	execInfo := &persistencespb.WorkflowExecutionInfo{
 		NamespaceId:         e.namespaceID.String(),
@@ -395,6 +400,19 @@ func makeCompletedEvent(data []byte) *historypb.HistoryEvent {
 						Data:     data,
 					}},
 				},
+			},
+		},
+	}
+}
+
+func makeTerminatedEvent(reason, identity string) *historypb.HistoryEvent {
+	return &historypb.HistoryEvent{
+		EventId:   8,
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED,
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionTerminatedEventAttributes{
+			WorkflowExecutionTerminatedEventAttributes: &historypb.WorkflowExecutionTerminatedEventAttributes{
+				Reason:   reason,
+				Identity: identity,
 			},
 		},
 	}
@@ -541,182 +559,101 @@ func TestResolveTargetValidation(t *testing.T) {
 func TestResolveTargetMissing(t *testing.T) {
 	t.Parallel()
 
-	t.Run("missing workflow with empty run ID", func(t *testing.T) {
-		t.Parallel()
+	testCases := []struct {
+		name  string
+		runID string
+	}{
+		{name: "missing workflow with empty run ID"},
+		{name: "missing explicit run ID", runID: uuid.NewString()},
+	}
 
-		env := newResolveTestEnv(t)
-		actionCalled := false
-		_, err := resolveTarget(
-			t.Context(),
-			env.shard,
-			env.checker,
-			resolveRequest{
-				namespaceID: env.namespaceID,
-				caller:      env.caller,
-				target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
-			},
-			func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
-				actionCalled = true
-				return api.UpdateWorkflowWithoutWorkflowTask, nil
-			},
-		)
-		var notFound *serviceerror.NotFound
-		require.ErrorAs(t, err, &notFound)
-		require.False(t, api.IsRetryableError(err))
-		require.False(t, actionCalled)
-		require.Zero(t, env.cache.totalUpdateCalls())
-		env.cache.requireNoLeakedLocks(t)
-	})
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	t.Run("missing explicit run ID", func(t *testing.T) {
-		t.Parallel()
-
-		env := newResolveTestEnv(t)
-		actionCalled := false
-		_, err := resolveTarget(
-			t.Context(),
-			env.shard,
-			env.checker,
-			resolveRequest{
-				namespaceID: env.namespaceID,
-				caller:      env.caller,
-				target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: uuid.NewString()},
-			},
-			func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
-				actionCalled = true
-				return api.UpdateWorkflowWithoutWorkflowTask, nil
-			},
-		)
-		var notFound *serviceerror.NotFound
-		require.ErrorAs(t, err, &notFound)
-		require.False(t, api.IsRetryableError(err))
-		require.False(t, actionCalled)
-		require.Zero(t, env.cache.totalUpdateCalls())
-		env.cache.requireNoLeakedLocks(t)
-	})
-
-	t.Run("superseded run whose current execution was deleted", func(t *testing.T) {
-		t.Parallel()
-
-		env := newResolveTestEnv(t)
-		c1 := uuid.NewString()
-		c2 := uuid.NewString()
-		env.addMockRun(mockRunSpec{
-			runID:             c1,
-			firstRunID:        c1,
-			running:           false,
-			status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
-			newExecutionRunID: c2,
+			env := newResolveTestEnv(t)
+			actionCalled := false
+			_, err := resolveTarget(
+				t.Context(),
+				env.shard,
+				env.checker,
+				resolveRequest{
+					namespaceID: env.namespaceID,
+					caller:      env.caller,
+					target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: tc.runID},
+				},
+				func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
+					actionCalled = true
+					return api.UpdateWorkflowWithoutWorkflowTask, nil
+				},
+			)
+			var notFound *serviceerror.NotFound
+			require.ErrorAs(t, err, &notFound)
+			require.False(t, api.IsRetryableError(err))
+			require.False(t, actionCalled)
+			require.Zero(t, env.cache.totalUpdateCalls())
+			env.cache.requireNoLeakedLocks(t)
 		})
-		// Default current execution returns NotFound.
-
-		actionCalled := false
-		_, err := resolveTarget(
-			t.Context(),
-			env.shard,
-			env.checker,
-			resolveRequest{
-				namespaceID: env.namespaceID,
-				caller:      env.caller,
-				target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: c1},
-			},
-			func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
-				actionCalled = true
-				return api.UpdateWorkflowWithoutWorkflowTask, nil
-			},
-		)
-		var notFound *serviceerror.NotFound
-		require.ErrorAs(t, err, &notFound)
-		require.False(t, api.IsRetryableError(err))
-		require.False(t, actionCalled)
-		require.Zero(t, env.cache.totalUpdateCalls())
-		env.cache.requireSingleRunLockAtATime(t)
-		env.cache.requireNoLeakedLocks(t)
-	})
+	}
 }
 
-func TestResolveTargetEmptyRunID(t *testing.T) {
+func TestResolveTargetDirectOpenAndClosed(t *testing.T) {
 	t.Parallel()
 
-	t.Run("open current run invokes action under lease and persists", func(t *testing.T) {
-		t.Parallel()
-
-		env := newResolveTestEnv(t)
-		firstRunID := uuid.NewString()
-		currentRunID := uuid.NewString()
-		run := env.addMockRun(mockRunSpec{
-			runID:      currentRunID,
-			firstRunID: firstRunID,
-			running:    true,
-		})
-		env.setCurrentRun(currentRunID)
-
-		var sawResolved resolvedTarget
-		var sawHeldLock bool
-		got, err := resolveTarget(
-			t.Context(),
-			env.shard,
-			env.checker,
-			resolveRequest{
-				namespaceID: env.namespaceID,
-				caller:      env.caller,
-				target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
-			},
-			func(_ api.WorkflowLease, target resolvedTarget) (*api.UpdateWorkflowAction, error) {
-				env.cache.mu.Lock()
-				sawHeldLock = env.cache.heldRunLocks == 1
-				env.cache.mu.Unlock()
-				sawResolved = target
-				return api.UpdateWorkflowWithoutWorkflowTask, nil
-			},
-		)
-		require.NoError(t, err)
-		require.True(t, sawHeldLock)
-		want := resolvedTarget{
-			workflowKey: definition.NewWorkflowKey(env.namespaceID.String(), env.workflowID, currentRunID),
-			firstRunID:  firstRunID,
+	for _, explicit := range []bool{false, true} {
+		name := "empty run ID open run invokes action under lease and persists"
+		if explicit {
+			name = "explicit open run invokes action under lease and persists"
 		}
-		require.Equal(t, want, got)
-		require.Equal(t, want, sawResolved)
-		require.Equal(t, 1, run.updateCalls)
-		env.cache.requireSingleRunLockAtATime(t)
-		env.cache.requireNoLeakedLocks(t)
-	})
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	t.Run("explicit open run invokes action under lease and persists", func(t *testing.T) {
-		t.Parallel()
+			env := newResolveTestEnv(t)
+			firstRunID := uuid.NewString()
+			runID := uuid.NewString()
+			run := env.addMockRun(mockRunSpec{
+				runID:      runID,
+				firstRunID: firstRunID,
+				running:    true,
+			})
+			env.setCurrentRun(runID)
 
-		env := newResolveTestEnv(t)
-		firstRunID := uuid.NewString()
-		runID := uuid.NewString()
-		run := env.addMockRun(mockRunSpec{
-			runID:      runID,
-			firstRunID: firstRunID,
-			running:    true,
+			targetRunID := ""
+			if explicit {
+				targetRunID = runID
+			}
+			var sawResolved resolvedTarget
+			var sawHeldLock bool
+			got, err := resolveTarget(
+				t.Context(),
+				env.shard,
+				env.checker,
+				resolveRequest{
+					namespaceID: env.namespaceID,
+					caller:      env.caller,
+					target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: targetRunID},
+				},
+				func(_ api.WorkflowLease, target resolvedTarget) (*api.UpdateWorkflowAction, error) {
+					env.cache.mu.Lock()
+					sawHeldLock = env.cache.heldRunLocks == 1
+					env.cache.mu.Unlock()
+					sawResolved = target
+					return api.UpdateWorkflowWithoutWorkflowTask, nil
+				},
+			)
+			require.NoError(t, err)
+			require.True(t, sawHeldLock)
+			want := resolvedTarget{
+				workflowKey: definition.NewWorkflowKey(env.namespaceID.String(), env.workflowID, runID),
+				firstRunID:  firstRunID,
+			}
+			require.Equal(t, want, got)
+			require.Equal(t, want, sawResolved)
+			require.Equal(t, 1, run.updateCalls)
+			env.cache.requireSingleRunLockAtATime(t)
+			env.cache.requireNoLeakedLocks(t)
 		})
-
-		got, err := resolveTarget(
-			t.Context(),
-			env.shard,
-			env.checker,
-			resolveRequest{
-				namespaceID: env.namespaceID,
-				caller:      env.caller,
-				target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: runID},
-			},
-			func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
-				return api.UpdateWorkflowWithoutWorkflowTask, nil
-			},
-		)
-		require.NoError(t, err)
-		require.Equal(t, resolvedTarget{
-			workflowKey: definition.NewWorkflowKey(env.namespaceID.String(), env.workflowID, runID),
-			firstRunID:  firstRunID,
-		}, got)
-		require.Equal(t, 1, run.updateCalls)
-		env.cache.requireSingleRunLockAtATime(t)
-		env.cache.requireNoLeakedLocks(t)
-	})
+	}
 
 	t.Run("closed terminal current run returns cloned close event and writes nothing", func(t *testing.T) {
 		t.Parallel()
@@ -727,7 +664,6 @@ func TestResolveTargetEmptyRunID(t *testing.T) {
 		env.addMockRun(mockRunSpec{
 			runID:      runID,
 			firstRunID: runID,
-			running:    false,
 			status:     enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
 			closeEvent: origEvent,
 		})
@@ -770,7 +706,6 @@ func TestResolveTargetEmptyRunID(t *testing.T) {
 		env.addMockRun(mockRunSpec{
 			runID:      runID,
 			firstRunID: runID,
-			running:    false,
 			status:     enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
 			closeEvent: makeCompletedEvent([]byte("done")),
 		})
@@ -794,6 +729,168 @@ func TestResolveTargetEmptyRunID(t *testing.T) {
 		require.Zero(t, env.cache.totalUpdateCalls())
 		env.cache.requireNoLeakedLocks(t)
 	})
+
+	t.Run("closed current run marked reset returns close event as final", func(t *testing.T) {
+		t.Parallel()
+
+		testCases := []struct {
+			name        string
+			explicitRun bool
+			specFn      func(runID string) mockRunSpec
+		}{
+			{
+				name: "empty run ID terminated with resetter identity",
+				specFn: func(runID string) mockRunSpec {
+					return mockRunSpec{
+						runID:      runID,
+						firstRunID: runID,
+						status:     enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED,
+						closeEvent: makeTerminatedEvent("user-terminated", consts.IdentityResetter),
+					}
+				},
+			},
+			{
+				name: "empty run ID marked workflow_was_reset with reset run ID",
+				specFn: func(runID string) mockRunSpec {
+					return mockRunSpec{
+						runID:            runID,
+						firstRunID:       runID,
+						status:           enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED,
+						workflowWasReset: true,
+						resetRunID:       uuid.NewString(),
+						closeEvent:       makeTerminatedEvent("reset", consts.IdentityResetter),
+					}
+				},
+			},
+			{
+				name:        "explicit run ID terminated with resetter identity while still current",
+				explicitRun: true,
+				specFn: func(runID string) mockRunSpec {
+					return mockRunSpec{
+						runID:      runID,
+						firstRunID: runID,
+						status:     enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED,
+						closeEvent: makeTerminatedEvent("user-terminated", consts.IdentityResetter),
+					}
+				},
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				env := newResolveTestEnv(t)
+				runID := uuid.NewString()
+				spec := tc.specFn(runID)
+				env.addMockRun(spec)
+				env.setCurrentRun(runID)
+
+				targetRunID := ""
+				if tc.explicitRun {
+					targetRunID = runID
+				}
+				got, err := resolveTarget(
+					t.Context(),
+					env.shard,
+					env.checker,
+					resolveRequest{
+						namespaceID: env.namespaceID,
+						caller:      env.caller,
+						target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: targetRunID},
+					},
+					nil,
+				)
+				require.NoError(t, err)
+				require.Equal(t, definition.NewWorkflowKey(env.namespaceID.String(), env.workflowID, runID), got.workflowKey)
+				require.Equal(t, runID, got.firstRunID)
+				protorequire.ProtoEqual(t, spec.closeEvent, got.closeEvent)
+				require.Zero(t, env.cache.totalUpdateCalls())
+				env.cache.requireSingleRunLockAtATime(t)
+				env.cache.requireNoLeakedLocks(t)
+			})
+		}
+	})
+}
+
+func TestResolveTargetZombieRun(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name  string
+		setup func(env *resolveTestEnv) string
+	}{
+		{
+			name: "explicit zombie run returns FailedPrecondition without reading close event",
+			setup: func(env *resolveTestEnv) string {
+				r1 := uuid.NewString()
+				// closeEvent is intentionally nil on strict mock so calling GetCompletionEvent fails the test.
+				env.addMockRun(mockRunSpec{
+					runID:      r1,
+					firstRunID: r1,
+					state:      enumsspb.WORKFLOW_EXECUTION_STATE_ZOMBIE,
+				})
+				return r1
+			},
+		},
+		{
+			name: "zombie run reached during chain walk returns FailedPrecondition",
+			setup: func(env *resolveTestEnv) string {
+				c1 := uuid.NewString()
+				c2 := uuid.NewString()
+				r2 := uuid.NewString()
+				env.addMockRun(mockRunSpec{
+					runID:             c1,
+					firstRunID:        c1,
+					status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
+					newExecutionRunID: c2,
+				})
+				env.addMockRun(mockRunSpec{
+					runID:      c2,
+					firstRunID: c1,
+					state:      enumsspb.WORKFLOW_EXECUTION_STATE_ZOMBIE,
+				})
+				env.addMockRun(mockRunSpec{
+					runID:      r2,
+					firstRunID: r2,
+					running:    true,
+				})
+				env.setCurrentRun(r2)
+				return c1
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			env := newResolveTestEnv(t)
+			targetRunID := tc.setup(env)
+			actionCalled := false
+			_, err := resolveTarget(
+				t.Context(),
+				env.shard,
+				env.checker,
+				resolveRequest{
+					namespaceID: env.namespaceID,
+					caller:      env.caller,
+					target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: targetRunID},
+				},
+				func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
+					actionCalled = true
+					return api.UpdateWorkflowWithoutWorkflowTask, nil
+				},
+			)
+			var failedPrecond *serviceerror.FailedPrecondition
+			require.ErrorAs(t, err, &failedPrecond)
+			require.False(t, api.IsRetryableError(err))
+			require.False(t, actionCalled)
+			require.Zero(t, env.cache.totalUpdateCalls())
+			env.cache.requireSingleRunLockAtATime(t)
+			env.cache.requireNoLeakedLocks(t)
+		})
+	}
 }
 
 func TestResolveTargetSuppliedTerminalRunWithNewerUnrelatedRun(t *testing.T) {
@@ -839,16 +936,7 @@ func TestResolveTargetSuppliedTerminalRunWithNewerUnrelatedRun(t *testing.T) {
 			name:           "terminated by terminate-existing conflict policy",
 			status:         enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED,
 			setSuccessorID: true,
-			closeEvent: &historypb.HistoryEvent{
-				EventId:   8,
-				EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED,
-				Attributes: &historypb.HistoryEvent_WorkflowExecutionTerminatedEventAttributes{
-					WorkflowExecutionTerminatedEventAttributes: &historypb.WorkflowExecutionTerminatedEventAttributes{
-						Reason:   "replaced",
-						Identity: "client",
-					},
-				},
-			},
+			closeEvent:     makeTerminatedEvent("replaced", "client"),
 		},
 		{
 			name:   "timed out without retry",
@@ -879,7 +967,6 @@ func TestResolveTargetSuppliedTerminalRunWithNewerUnrelatedRun(t *testing.T) {
 			spec := mockRunSpec{
 				runID:      r1,
 				firstRunID: r1,
-				running:    false,
 				status:     tc.status,
 				closeEvent: tc.closeEvent,
 			}
@@ -928,7 +1015,6 @@ func TestResolveTargetSuppliedTerminalRunWithNewerUnrelatedRun(t *testing.T) {
 		env.addMockRun(mockRunSpec{
 			runID:      r1,
 			firstRunID: r1,
-			running:    false,
 			status:     enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
 			closeEvent: origEvent,
 		})
@@ -977,14 +1063,12 @@ func TestResolveTargetChainResolution(t *testing.T) {
 		env.addMockRun(mockRunSpec{
 			runID:             c1,
 			firstRunID:        c1,
-			running:           false,
 			status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
 			newExecutionRunID: c2,
 		})
 		c2Run := env.addMockRun(mockRunSpec{
 			runID:             c2,
 			firstRunID:        c1,
-			running:           false,
 			status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
 			newExecutionRunID: c3,
 		})
@@ -1013,7 +1097,7 @@ func TestResolveTargetChainResolution(t *testing.T) {
 			workflowKey: definition.NewWorkflowKey(env.namespaceID.String(), env.workflowID, c3),
 			firstRunID:  c1,
 		}, got)
-		require.Zero(t, c2Run.acquireCalls, "intermediate run should not be locked")
+		require.Zero(t, c2Run.acquireCalls, "intermediate run should not be locked when current is same chain")
 		require.Equal(t, 1, c3Run.updateCalls)
 		env.cache.requireSingleRunLockAtATime(t)
 		env.cache.requireNoLeakedLocks(t)
@@ -1036,14 +1120,12 @@ func TestResolveTargetChainResolution(t *testing.T) {
 		env.addMockRun(mockRunSpec{
 			runID:             c1,
 			firstRunID:        c1,
-			running:           false,
 			status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
 			newExecutionRunID: c2,
 		})
 		env.addMockRun(mockRunSpec{
 			runID:      c3,
 			firstRunID: c1,
-			running:    false,
 			status:     enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
 			closeEvent: c3Close,
 		})
@@ -1169,15 +1251,7 @@ func TestResolveTargetChainResolution(t *testing.T) {
 						runID:      c1,
 						firstRunID: c1,
 						status:     enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED,
-						closeEvent: &historypb.HistoryEvent{
-							EventId:   4,
-							EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED,
-							Attributes: &historypb.HistoryEvent_WorkflowExecutionTerminatedEventAttributes{
-								WorkflowExecutionTerminatedEventAttributes: &historypb.WorkflowExecutionTerminatedEventAttributes{
-									Identity: consts.IdentityResetter,
-								},
-							},
-						},
+						closeEvent: makeTerminatedEvent("reset", consts.IdentityResetter),
 					}
 				},
 			},
@@ -1221,84 +1295,51 @@ func TestResolveTargetChainResolution(t *testing.T) {
 	})
 }
 
-func TestResolveTargetDifferentChainReusedWorkflowID(t *testing.T) {
+func TestResolveTargetWalkAfterWorkflowIDReuse(t *testing.T) {
 	t.Parallel()
 
-	testCases := []struct {
-		name               string
-		requestedFirstRun  func(c1 string) string
-		currentFirstRun    func(r2 string) string
-		currentRunning     bool
-		currentSuccessorID string
-		callerIsCurrent    bool
-	}{
-		{
-			name:              "reused workflow ID R2 is open",
-			requestedFirstRun: func(c1 string) string { return c1 },
-			currentFirstRun:   func(r2 string) string { return r2 },
-			currentRunning:    true,
-		},
-		{
-			name:              "reused workflow ID R2 is closed",
-			requestedFirstRun: func(c1 string) string { return c1 },
-			currentFirstRun:   func(r2 string) string { return r2 },
-			currentRunning:    false,
-		},
-		{
-			name:               "reused workflow ID R2 is itself superseded",
-			requestedFirstRun:  func(c1 string) string { return c1 },
-			currentFirstRun:    func(r2 string) string { return r2 },
-			currentRunning:     false,
-			currentSuccessorID: uuid.NewString(),
-		},
-		{
-			name:              "caller is reused workflow ID R2 targeting old chain C1",
-			requestedFirstRun: func(c1 string) string { return c1 },
-			currentFirstRun:   func(r2 string) string { return r2 },
-			currentRunning:    true,
-			callerIsCurrent:   true,
-		},
-		{
-			name:              "empty first run ID on requested and current never matches",
-			requestedFirstRun: func(string) string { return "" },
-			currentFirstRun:   func(string) string { return "" },
-			currentRunning:    true,
-		},
-		{
-			name:              "empty first run ID on current never matches",
-			requestedFirstRun: func(c1 string) string { return c1 },
-			currentFirstRun:   func(string) string { return "" },
-			currentRunning:    true,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, callerIsR2 := range []bool{false, true} {
+		name := "C1 pinned after R2 reuse walks C1 to C2 to C3 and returns C3 close event"
+		if callerIsR2 {
+			name = "caller R2 targeting old chain C1 is not a self-wait and returns C3 close event"
+		}
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			env := newResolveTestEnv(t)
 			c1 := uuid.NewString()
 			c2 := uuid.NewString()
+			c3 := uuid.NewString()
 			r2 := uuid.NewString()
+			c3Close := makeCompletedEvent([]byte("chain-c3-result"))
+
 			env.addMockRun(mockRunSpec{
 				runID:             c1,
-				firstRunID:        tc.requestedFirstRun(c1),
-				running:           false,
+				firstRunID:        c1,
 				status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
 				newExecutionRunID: c2,
 			})
 			env.addMockRun(mockRunSpec{
-				runID:             r2,
-				firstRunID:        tc.currentFirstRun(r2),
-				running:           tc.currentRunning,
-				status:            enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
-				newExecutionRunID: tc.currentSuccessorID,
-				closeEvent:        makeCompletedEvent([]byte("unrelated")),
+				runID:             c2,
+				firstRunID:        c1,
+				status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
+				newExecutionRunID: c3,
+			})
+			env.addMockRun(mockRunSpec{
+				runID:      c3,
+				firstRunID: c1,
+				status:     enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+				closeEvent: c3Close,
+			})
+			env.addMockRun(mockRunSpec{
+				runID:      r2,
+				firstRunID: r2,
+				running:    true,
 			})
 			env.setCurrentRun(r2)
 
 			caller := env.caller
-			if tc.callerIsCurrent {
+			if callerIsR2 {
 				caller = &historyservice.NexusCallerInfo{
 					NamespaceId: env.namespaceID.String(),
 					WorkflowId:  env.workflowID,
@@ -1307,8 +1348,7 @@ func TestResolveTargetDifferentChainReusedWorkflowID(t *testing.T) {
 				}
 			}
 
-			actionCalled := false
-			_, err := resolveTarget(
+			got, err := resolveTarget(
 				t.Context(),
 				env.shard,
 				env.checker,
@@ -1317,166 +1357,304 @@ func TestResolveTargetDifferentChainReusedWorkflowID(t *testing.T) {
 					caller:      caller,
 					target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: c1},
 				},
-				func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
-					actionCalled = true
-					return api.UpdateWorkflowWithoutWorkflowTask, nil
-				},
+				nil,
 			)
-			var failedPrecond *serviceerror.FailedPrecondition
-			require.ErrorAs(t, err, &failedPrecond)
-			require.False(t, api.IsRetryableError(err))
-			require.False(t, actionCalled)
+			require.NoError(t, err)
+			require.Equal(t, definition.NewWorkflowKey(env.namespaceID.String(), env.workflowID, c3), got.workflowKey)
+			require.Equal(t, c1, got.firstRunID)
+			protorequire.ProtoEqual(t, c3Close, got.closeEvent)
 			require.Zero(t, env.cache.totalUpdateCalls())
 			env.cache.requireSingleRunLockAtATime(t)
 			env.cache.requireNoLeakedLocks(t)
+			require.Equal(t, []lockEvent{
+				{op: "acquire", runID: c1},
+				{op: "release", runID: c1, err: nil},
+				{op: "acquire", runID: r2},
+				{op: "release", runID: r2, err: nil},
+				{op: "acquire", runID: c2},
+				{op: "release", runID: c2, err: nil},
+				{op: "acquire", runID: c3},
+				{op: "release", runID: c3, err: nil},
+			}, env.cache.snapshotLockEvents())
 		})
 	}
-}
 
-func TestResolveTargetSelfWaitAliases(t *testing.T) {
-	t.Parallel()
-
-	t.Run("C2 awaiting predecessor C1 in same chain", func(t *testing.T) {
-		t.Parallel()
-
-		env := newResolveTestEnv(t)
-		c1 := uuid.NewString()
-		c2 := uuid.NewString()
-		env.addMockRun(mockRunSpec{
-			runID:             c1,
-			firstRunID:        c1,
-			running:           false,
-			status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
-			newExecutionRunID: c2,
-		})
-		env.addMockRun(mockRunSpec{
-			runID:      c2,
-			firstRunID: c1,
-			running:    true,
-		})
-		env.setCurrentRun(c2)
-
-		caller := &historyservice.NexusCallerInfo{
-			NamespaceId: env.namespaceID.String(),
-			WorkflowId:  env.workflowID,
-			RunId:       c2,
-			RequestId:   uuid.NewString(),
-		}
-		actionCalled := false
-		_, err := resolveTarget(
-			t.Context(),
-			env.shard,
-			env.checker,
-			resolveRequest{
-				namespaceID: env.namespaceID,
-				caller:      caller,
-				target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: c1},
-			},
-			func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
-				actionCalled = true
-				return api.UpdateWorkflowWithoutWorkflowTask, nil
-			},
-		)
-		var invalidArg *serviceerror.InvalidArgument
-		require.ErrorAs(t, err, &invalidArg)
-		require.False(t, api.IsRetryableError(err))
-		require.False(t, actionCalled)
-		require.Zero(t, env.cache.totalUpdateCalls())
-		env.cache.requireSingleRunLockAtATime(t)
-		env.cache.requireNoLeakedLocks(t)
-		require.Equal(t, []lockEvent{
-			{op: "acquire", runID: c1},
-			{op: "release", runID: c1, err: nil},
-			{op: "acquire", runID: c2},
-			{op: "release", runID: c2, err: nil},
-		}, env.cache.snapshotLockEvents())
-	})
-
-	t.Run("C3 awaiting head C1 across multi-hop chain", func(t *testing.T) {
+	t.Run("walk prefers ResetRunId over NewExecutionRunId and supports open tail run", func(t *testing.T) {
 		t.Parallel()
 
 		env := newResolveTestEnv(t)
 		c1 := uuid.NewString()
 		c2 := uuid.NewString()
 		c3 := uuid.NewString()
+		r2 := uuid.NewString()
+
 		env.addMockRun(mockRunSpec{
 			runID:             c1,
 			firstRunID:        c1,
-			running:           false,
 			status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
 			newExecutionRunID: c2,
+			resetRunID:        c3,
 		})
-		env.addMockRun(mockRunSpec{
+		c2Run := env.addMockRun(mockRunSpec{
+			runID:            c2,
+			firstRunID:       c1,
+			status:           enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED,
+			workflowWasReset: true,
+		})
+		c3Run := env.addMockRun(mockRunSpec{
 			runID:      c3,
 			firstRunID: c1,
 			running:    true,
 		})
-		env.setCurrentRun(c3)
+		env.addMockRun(mockRunSpec{
+			runID:      r2,
+			firstRunID: r2,
+			running:    true,
+		})
+		env.setCurrentRun(r2)
 
-		caller := &historyservice.NexusCallerInfo{
-			NamespaceId: env.namespaceID.String(),
-			WorkflowId:  env.workflowID,
-			RunId:       c3,
-			RequestId:   uuid.NewString(),
-		}
-		_, err := resolveTarget(
+		got, err := resolveTarget(
 			t.Context(),
 			env.shard,
 			env.checker,
 			resolveRequest{
 				namespaceID: env.namespaceID,
-				caller:      caller,
+				caller:      env.caller,
 				target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: c1},
 			},
-			nil,
+			func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
+				return api.UpdateWorkflowWithoutWorkflowTask, nil
+			},
 		)
-		var invalidArg *serviceerror.InvalidArgument
-		require.ErrorAs(t, err, &invalidArg)
-		require.False(t, api.IsRetryableError(err))
-		require.Zero(t, env.cache.totalUpdateCalls())
+		require.NoError(t, err)
+		require.Equal(t, resolvedTarget{
+			workflowKey: definition.NewWorkflowKey(env.namespaceID.String(), env.workflowID, c3),
+			firstRunID:  c1,
+		}, got)
+		require.Zero(t, c2Run.acquireCalls, "reset branch should bypass abandoned continuation C2")
+		require.Equal(t, 1, c3Run.updateCalls)
 		env.cache.requireSingleRunLockAtATime(t)
 		env.cache.requireNoLeakedLocks(t)
 	})
 
-	t.Run("C1 awaiting explicit descendant C2 in same chain", func(t *testing.T) {
+	t.Run("broken chain walk returns non-retryable FailedPrecondition", func(t *testing.T) {
 		t.Parallel()
 
-		env := newResolveTestEnv(t)
-		c1 := uuid.NewString()
-		c2 := uuid.NewString()
-		env.addMockRun(mockRunSpec{
-			runID:      c2,
-			firstRunID: c1,
-			running:    true,
-		})
-
-		caller := &historyservice.NexusCallerInfo{
-			NamespaceId: env.namespaceID.String(),
-			WorkflowId:  env.workflowID,
-			RunId:       c1,
-			RequestId:   uuid.NewString(),
+		testCases := []struct {
+			name  string
+			setup func(env *resolveTestEnv) string
+		}{
+			{
+				name: "deleted middle run C2",
+				setup: func(env *resolveTestEnv) string {
+					c1 := uuid.NewString()
+					c2 := uuid.NewString()
+					c3 := uuid.NewString()
+					r2 := uuid.NewString()
+					env.addMockRun(mockRunSpec{
+						runID:             c1,
+						firstRunID:        c1,
+						status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
+						newExecutionRunID: c2,
+					})
+					// c2 intentionally omitted to simulate retention deletion.
+					env.addMockRun(mockRunSpec{
+						runID:      c3,
+						firstRunID: c1,
+						status:     enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+						closeEvent: makeCompletedEvent([]byte("unreachable")),
+					})
+					env.addMockRun(mockRunSpec{
+						runID:      r2,
+						firstRunID: r2,
+						running:    true,
+					})
+					env.setCurrentRun(r2)
+					return c1
+				},
+			},
+			{
+				name: "superseded run with missing current execution and deleted successor",
+				setup: func(env *resolveTestEnv) string {
+					c1 := uuid.NewString()
+					c2 := uuid.NewString()
+					env.addMockRun(mockRunSpec{
+						runID:             c1,
+						firstRunID:        c1,
+						status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
+						newExecutionRunID: c2,
+					})
+					// Default current execution is NotFound and c2 is absent.
+					return c1
+				},
+			},
+			{
+				name: "superseded run with no forward successor pointer after reuse",
+				setup: func(env *resolveTestEnv) string {
+					c1 := uuid.NewString()
+					r2 := uuid.NewString()
+					env.addMockRun(mockRunSpec{
+						runID:            c1,
+						firstRunID:       c1,
+						status:           enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED,
+						workflowWasReset: true,
+					})
+					env.addMockRun(mockRunSpec{
+						runID:      r2,
+						firstRunID: r2,
+						running:    true,
+					})
+					env.setCurrentRun(r2)
+					return c1
+				},
+			},
+			{
+				name: "cycle in successor pointers",
+				setup: func(env *resolveTestEnv) string {
+					c1 := uuid.NewString()
+					c2 := uuid.NewString()
+					r2 := uuid.NewString()
+					env.addMockRun(mockRunSpec{
+						runID:             c1,
+						firstRunID:        c1,
+						status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
+						newExecutionRunID: c2,
+					})
+					env.addMockRun(mockRunSpec{
+						runID:             c2,
+						firstRunID:        c1,
+						status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
+						newExecutionRunID: c1,
+					})
+					env.addMockRun(mockRunSpec{
+						runID:      r2,
+						firstRunID: r2,
+						running:    true,
+					})
+					env.setCurrentRun(r2)
+					return c1
+				},
+			},
+			{
+				name: "hop limit exceeded",
+				setup: func(env *resolveTestEnv) string {
+					runIDs := make([]string, maxChainWalkHops+2)
+					for i := range runIDs {
+						runIDs[i] = uuid.NewString()
+					}
+					for i := range maxChainWalkHops + 1 {
+						env.addMockRun(mockRunSpec{
+							runID:             runIDs[i],
+							firstRunID:        runIDs[0],
+							status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
+							newExecutionRunID: runIDs[i+1],
+						})
+					}
+					env.addMockRun(mockRunSpec{
+						runID:      runIDs[maxChainWalkHops+1],
+						firstRunID: runIDs[0],
+						status:     enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+						closeEvent: makeCompletedEvent([]byte("too-far")),
+					})
+					r2 := uuid.NewString()
+					env.addMockRun(mockRunSpec{
+						runID:      r2,
+						firstRunID: r2,
+						running:    true,
+					})
+					env.setCurrentRun(r2)
+					return runIDs[0]
+				},
+			},
 		}
-		actionCalled := false
-		_, err := resolveTarget(
-			t.Context(),
-			env.shard,
-			env.checker,
-			resolveRequest{
-				namespaceID: env.namespaceID,
-				caller:      caller,
-				target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: c2},
-			},
-			func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
-				actionCalled = true
-				return api.UpdateWorkflowWithoutWorkflowTask, nil
-			},
-		)
-		var invalidArg *serviceerror.InvalidArgument
-		require.ErrorAs(t, err, &invalidArg)
-		require.False(t, actionCalled)
-		require.Zero(t, env.cache.totalUpdateCalls())
-		env.cache.requireNoLeakedLocks(t)
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				env := newResolveTestEnv(t)
+				startRunID := tc.setup(env)
+				actionCalled := false
+				_, err := resolveTarget(
+					t.Context(),
+					env.shard,
+					env.checker,
+					resolveRequest{
+						namespaceID: env.namespaceID,
+						caller:      env.caller,
+						target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: startRunID},
+					},
+					func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
+						actionCalled = true
+						return api.UpdateWorkflowWithoutWorkflowTask, nil
+					},
+				)
+				var failedPrecond *serviceerror.FailedPrecondition
+				require.ErrorAs(t, err, &failedPrecond)
+				require.False(t, api.IsRetryableError(err))
+				require.False(t, actionCalled)
+				require.Zero(t, env.cache.totalUpdateCalls())
+				env.cache.requireSingleRunLockAtATime(t)
+				env.cache.requireNoLeakedLocks(t)
+			})
+		}
 	})
+}
+
+func TestResolveTargetSelfWaitAliases(t *testing.T) {
+	t.Parallel()
+
+	env := newResolveTestEnv(t)
+	c1 := uuid.NewString()
+	c2 := uuid.NewString()
+	c3 := uuid.NewString()
+	env.addMockRun(mockRunSpec{
+		runID:             c1,
+		firstRunID:        c1,
+		status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
+		newExecutionRunID: c2,
+	})
+	env.addMockRun(mockRunSpec{
+		runID:      c3,
+		firstRunID: c1,
+		running:    true,
+	})
+	env.setCurrentRun(c3)
+
+	caller := &historyservice.NexusCallerInfo{
+		NamespaceId: env.namespaceID.String(),
+		WorkflowId:  env.workflowID,
+		RunId:       c3,
+		RequestId:   uuid.NewString(),
+	}
+	actionCalled := false
+	_, err := resolveTarget(
+		t.Context(),
+		env.shard,
+		env.checker,
+		resolveRequest{
+			namespaceID: env.namespaceID,
+			caller:      caller,
+			target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID, RunId: c1},
+		},
+		func(api.WorkflowLease, resolvedTarget) (*api.UpdateWorkflowAction, error) {
+			actionCalled = true
+			return api.UpdateWorkflowWithoutWorkflowTask, nil
+		},
+	)
+	var invalidArg *serviceerror.InvalidArgument
+	require.ErrorAs(t, err, &invalidArg)
+	require.False(t, api.IsRetryableError(err))
+	require.False(t, actionCalled)
+	require.Zero(t, env.cache.totalUpdateCalls())
+	env.cache.requireSingleRunLockAtATime(t)
+	env.cache.requireNoLeakedLocks(t)
+	require.Equal(t, []lockEvent{
+		{op: "acquire", runID: c1},
+		{op: "release", runID: c1, err: nil},
+		{op: "acquire", runID: c3},
+		{op: "release", runID: c3, err: nil},
+	}, env.cache.snapshotLockEvents())
 }
 
 func TestResolveTargetStaleCurrentRunRetry(t *testing.T) {
@@ -1492,7 +1670,6 @@ func TestResolveTargetStaleCurrentRunRetry(t *testing.T) {
 		env.addMockRun(mockRunSpec{
 			runID:             c2,
 			firstRunID:        c1,
-			running:           false,
 			status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
 			newExecutionRunID: c3,
 		})
@@ -1501,8 +1678,6 @@ func TestResolveTargetStaleCurrentRunRetry(t *testing.T) {
 			firstRunID: c1,
 			running:    true,
 		})
-		// First GetCurrentExecution returns stale c2; checker sees c2 closed, re-checks current and gets c3,
-		// releases c2, returns ErrLocateCurrentWorkflowExecution; retry reads c3 and succeeds.
 		env.setCurrentSequence(
 			currentExecutionResponse{runID: c2},
 			currentExecutionResponse{runID: c3},
@@ -1545,14 +1720,12 @@ func TestResolveTargetStaleCurrentRunRetry(t *testing.T) {
 		c1Run := env.addMockRun(mockRunSpec{
 			runID:             c1,
 			firstRunID:        c1,
-			running:           false,
 			status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
 			newExecutionRunID: c2,
 		})
 		env.addMockRun(mockRunSpec{
 			runID:             c2,
 			firstRunID:        c1,
-			running:           false,
 			status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
 			newExecutionRunID: c3,
 		})
@@ -1561,8 +1734,6 @@ func TestResolveTargetStaleCurrentRunRetry(t *testing.T) {
 			firstRunID: c1,
 			running:    true,
 		})
-		// Simulate current pointer briefly returning c2 on both checker lookups, so resolver itself detects
-		// c2 is superseded, releases c2, and retries to get c3.
 		env.setCurrentSequence(
 			currentExecutionResponse{runID: c2},
 			currentExecutionResponse{runID: c2},
@@ -1614,7 +1785,6 @@ func TestResolveTargetStaleCurrentRunRetry(t *testing.T) {
 		freshClosedC2 := env.newMockMutableState(mockRunSpec{
 			runID:             c2,
 			firstRunID:        c1,
-			running:           false,
 			status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
 			newExecutionRunID: c3,
 		})
@@ -1682,67 +1852,6 @@ func TestResolveTargetStaleCurrentRunRetry(t *testing.T) {
 		}, env.cache.snapshotLockEvents())
 	})
 
-	t.Run("mutation conflict on stale current run with empty run ID retries on new current run", func(t *testing.T) {
-		t.Parallel()
-
-		env := newResolveTestEnv(t)
-		c1 := uuid.NewString()
-		c2 := uuid.NewString()
-		c3 := uuid.NewString()
-
-		conflictErr := &persistence.CurrentWorkflowConditionFailedError{
-			Msg:   "current run moved to c3",
-			RunID: c3,
-		}
-		c2Run := env.addMockRun(mockRunSpec{
-			runID:      c2,
-			firstRunID: c1,
-			running:    true,
-		})
-		c2Run.updateFn = func(context.Context) error {
-			return conflictErr
-		}
-		c3Run := env.addMockRun(mockRunSpec{
-			runID:      c3,
-			firstRunID: c1,
-			running:    true,
-		})
-		env.setCurrentSequence(currentExecutionResponse{runID: c2})
-		env.setCurrentRun(c3)
-
-		var mutatedRuns []string
-		got, err := resolveTarget(
-			t.Context(),
-			env.shard,
-			env.checker,
-			resolveRequest{
-				namespaceID: env.namespaceID,
-				caller:      env.caller,
-				target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
-			},
-			func(_ api.WorkflowLease, target resolvedTarget) (*api.UpdateWorkflowAction, error) {
-				mutatedRuns = append(mutatedRuns, target.workflowKey.RunID)
-				return api.UpdateWorkflowWithoutWorkflowTask, nil
-			},
-		)
-		require.NoError(t, err)
-		require.Equal(t, []string{c2, c3}, mutatedRuns)
-		require.Equal(t, resolvedTarget{
-			workflowKey: definition.NewWorkflowKey(env.namespaceID.String(), env.workflowID, c3),
-			firstRunID:  c1,
-		}, got)
-		require.Equal(t, 1, c2Run.clearCalls)
-		require.Equal(t, 1, c3Run.updateCalls)
-		env.cache.requireSingleRunLockAtATime(t)
-		env.cache.requireNoLeakedLocks(t)
-		require.Equal(t, []lockEvent{
-			{op: "acquire", runID: c2},
-			{op: "release", runID: c2, err: conflictErr},
-			{op: "acquire", runID: c3},
-			{op: "release", runID: c3, err: nil},
-		}, env.cache.snapshotLockEvents())
-	})
-
 	t.Run("bounded retries return ErrLocateCurrentWorkflowExecution when current stays stale", func(t *testing.T) {
 		t.Parallel()
 
@@ -1752,7 +1861,6 @@ func TestResolveTargetStaleCurrentRunRetry(t *testing.T) {
 		c1Run := env.addMockRun(mockRunSpec{
 			runID:             c1,
 			firstRunID:        c1,
-			running:           false,
 			status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
 			newExecutionRunID: c2,
 		})
@@ -1806,7 +1914,6 @@ func TestResolveTargetStaleCurrentRunRetry(t *testing.T) {
 		env.addMockRun(mockRunSpec{
 			runID:         r1,
 			firstRunID:    r1,
-			running:       false,
 			status:        enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
 			closeEventErr: workflow.ErrMissingWorkflowCompletionEvent,
 		})
@@ -1838,6 +1945,7 @@ func buildLegacyMutableState(
 	startEventFirstRunID string,
 	running bool,
 	newExecutionRunID string,
+	closeEvent *historypb.HistoryEvent,
 ) historyi.MutableState {
 	t.Helper()
 
@@ -1847,20 +1955,32 @@ func buildLegacyMutableState(
 	if running {
 		state = enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING
 		status = enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING
+	} else if newExecutionRunID == "" {
+		status = enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED
+	}
+
+	nextEventID := int64(3)
+	lastEventID := int64(2)
+	completionBatchID := int64(0)
+	if closeEvent != nil {
+		lastEventID = closeEvent.GetEventId()
+		nextEventID = lastEventID + 1
+		completionBatchID = lastEventID
 	}
 
 	dbState := &persistencespb.WorkflowMutableState{
 		ExecutionInfo: &persistencespb.WorkflowExecutionInfo{
-			NamespaceId:       tests.NamespaceID.String(),
-			WorkflowId:        workflowID,
-			NewExecutionRunId: newExecutionRunID,
+			NamespaceId:            tests.NamespaceID.String(),
+			WorkflowId:             workflowID,
+			NewExecutionRunId:      newExecutionRunID,
+			CompletionEventBatchId: completionBatchID,
 			VersionHistories: &historyspb.VersionHistories{
 				CurrentVersionHistoryIndex: 0,
 				Histories: []*historyspb.VersionHistory{
 					{
 						BranchToken: branchToken,
 						Items: []*historyspb.VersionHistoryItem{
-							{EventId: 2, Version: tests.Version},
+							{EventId: lastEventID, Version: tests.Version},
 						},
 					},
 				},
@@ -1871,7 +1991,7 @@ func buildLegacyMutableState(
 			State:  state,
 			Status: status,
 		},
-		NextEventId: 3,
+		NextEventId: nextEventID,
 	}
 
 	ms, err := workflow.NewMutableStateFromDB(
@@ -1912,6 +2032,24 @@ func buildLegacyMutableState(
 		branchToken,
 	).Return(startEvent, nil)
 
+	if closeEvent != nil {
+		closeEventKey := events.EventKey{
+			NamespaceID: tests.NamespaceID,
+			WorkflowID:  workflowID,
+			RunID:       runID,
+			EventID:     closeEvent.GetEventId(),
+			Version:     tests.Version,
+			ShardUUID:   testShard.GetOwner(),
+		}
+		testShard.MockEventsCache.EXPECT().GetEvent(
+			gomock.Any(),
+			testShard.GetShardID(),
+			closeEventKey,
+			completionBatchID,
+			branchToken,
+		).Return(closeEvent, nil)
+	}
+
 	return ms
 }
 
@@ -1948,8 +2086,8 @@ func TestResolveTargetLegacyStartEventFallback(t *testing.T) {
 		c2 := uuid.NewString()
 		c3 := uuid.NewString()
 
-		c1MS := buildLegacyMutableState(t, testShard, wfID, c1, c1, false, c2)
-		c3MS := buildLegacyMutableState(t, testShard, wfID, c3, c1, true, "")
+		c1MS := buildLegacyMutableState(t, testShard, wfID, c1, c1, false, c2, nil)
+		c3MS := buildLegacyMutableState(t, testShard, wfID, c3, c1, true, "", nil)
 
 		cache := newTrackingWorkflowCache()
 		cache.addRun(&fakeRun{
@@ -1993,22 +2131,34 @@ func TestResolveTargetLegacyStartEventFallback(t *testing.T) {
 		cache.requireNoLeakedLocks(t)
 	})
 
-	t.Run("different chain rejected through start-event fallback on both runs", func(t *testing.T) {
+	t.Run("different chain detected via start-event fallback triggers walk to C3", func(t *testing.T) {
 		t.Parallel()
 
 		testShard := newLegacyTestShard(t)
 		wfID := "legacy-reused-wf-" + uuid.NewString()
 		c1 := uuid.NewString()
 		c2 := uuid.NewString()
+		c3 := uuid.NewString()
 		r2 := uuid.NewString()
+		c3Close := makeCompletedEvent([]byte("legacy-c3-close"))
 
-		c1MS := buildLegacyMutableState(t, testShard, wfID, c1, c1, false, c2)
-		r2MS := buildLegacyMutableState(t, testShard, wfID, r2, r2, true, "")
+		c1MS := buildLegacyMutableState(t, testShard, wfID, c1, c1, false, c2, nil)
+		c2MS := buildLegacyMutableState(t, testShard, wfID, c2, c1, false, c3, nil)
+		c3MS := buildLegacyMutableState(t, testShard, wfID, c3, c1, false, "", c3Close)
+		r2MS := buildLegacyMutableState(t, testShard, wfID, r2, r2, true, "", nil)
 
 		cache := newTrackingWorkflowCache()
 		cache.addRun(&fakeRun{
 			key:    definition.NewWorkflowKey(tests.NamespaceID.String(), wfID, c1),
 			loadFn: func(context.Context) (historyi.MutableState, error) { return c1MS, nil },
+		})
+		cache.addRun(&fakeRun{
+			key:    definition.NewWorkflowKey(tests.NamespaceID.String(), wfID, c2),
+			loadFn: func(context.Context) (historyi.MutableState, error) { return c2MS, nil },
+		})
+		cache.addRun(&fakeRun{
+			key:    definition.NewWorkflowKey(tests.NamespaceID.String(), wfID, c3),
+			loadFn: func(context.Context) (historyi.MutableState, error) { return c3MS, nil },
 		})
 		cache.addRun(&fakeRun{
 			key:    definition.NewWorkflowKey(tests.NamespaceID.String(), wfID, r2),
@@ -2027,7 +2177,7 @@ func TestResolveTargetLegacyStartEventFallback(t *testing.T) {
 			RequestId:   uuid.NewString(),
 		}
 
-		_, err := resolveTarget(
+		got, err := resolveTarget(
 			t.Context(),
 			testShard,
 			checker,
@@ -2038,57 +2188,10 @@ func TestResolveTargetLegacyStartEventFallback(t *testing.T) {
 			},
 			nil,
 		)
-		var failedPrecond *serviceerror.FailedPrecondition
-		require.ErrorAs(t, err, &failedPrecond)
-		require.False(t, api.IsRetryableError(err))
-		cache.requireSingleRunLockAtATime(t)
-		cache.requireNoLeakedLocks(t)
-	})
-
-	t.Run("empty run ID loads first run ID from legacy start event", func(t *testing.T) {
-		t.Parallel()
-
-		testShard := newLegacyTestShard(t)
-		wfID := "legacy-open-wf-" + uuid.NewString()
-		c1 := uuid.NewString()
-		c2 := uuid.NewString()
-
-		c2MS := buildLegacyMutableState(t, testShard, wfID, c2, c1, true, "")
-
-		cache := newTrackingWorkflowCache()
-		cache.addRun(&fakeRun{
-			key:    definition.NewWorkflowKey(tests.NamespaceID.String(), wfID, c2),
-			loadFn: func(context.Context) (historyi.MutableState, error) { return c2MS, nil },
-		})
-		testShard.Resource.ExecutionMgr.EXPECT().GetCurrentExecution(gomock.Any(), gomock.Any()).Return(
-			&persistence.GetCurrentExecutionResponse{RunID: c2},
-			nil,
-		)
-
-		checker := api.NewWorkflowConsistencyChecker(testShard, cache)
-		caller := &historyservice.NexusCallerInfo{
-			NamespaceId: tests.NamespaceID.String(),
-			WorkflowId:  "caller-" + uuid.NewString(),
-			RunId:       uuid.NewString(),
-			RequestId:   uuid.NewString(),
-		}
-
-		got, err := resolveTarget(
-			t.Context(),
-			testShard,
-			checker,
-			resolveRequest{
-				namespaceID: tests.NamespaceID,
-				caller:      caller,
-				target:      &commonpb.WorkflowExecution{WorkflowId: wfID},
-			},
-			nil,
-		)
 		require.NoError(t, err)
-		require.Equal(t, resolvedTarget{
-			workflowKey: definition.NewWorkflowKey(tests.NamespaceID.String(), wfID, c2),
-			firstRunID:  c1,
-		}, got)
+		require.Equal(t, definition.NewWorkflowKey(tests.NamespaceID.String(), wfID, c3), got.workflowKey)
+		require.Equal(t, c1, got.firstRunID)
+		protorequire.ProtoEqual(t, c3Close, got.closeEvent)
 		cache.requireSingleRunLockAtATime(t)
 		cache.requireNoLeakedLocks(t)
 	})
@@ -2105,14 +2208,12 @@ func TestResolveTargetConcurrent(t *testing.T) {
 	env.addMockRun(mockRunSpec{
 		runID:             c1,
 		firstRunID:        c1,
-		running:           false,
 		status:            enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
 		newExecutionRunID: c2,
 	})
 	env.addMockRun(mockRunSpec{
 		runID:      c3,
 		firstRunID: c1,
-		running:    false,
 		status:     enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
 		closeEvent: closeEvent,
 	})
