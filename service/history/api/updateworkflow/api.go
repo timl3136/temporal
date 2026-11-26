@@ -368,6 +368,11 @@ func validateCallbacks(
 	if len(updateRequest.GetCompletionCallbacks()) == 0 {
 		return nil
 	}
+	for _, cb := range updateRequest.GetCompletionCallbacks() {
+		if cb.GetResultSubscription() != nil {
+			return serviceerror.NewInvalidArgument("callback must not specify result_subscription")
+		}
+	}
 	updateID := updateRequest.GetMeta().GetUpdateId()
 
 	// A request for an Update that has already completed receives its outcome synchronously and

@@ -237,6 +237,92 @@ func TestValidateCallbacks(t *testing.T) {
 	})
 }
 
+func TestValidateRejectsResultSubscription(t *testing.T) {
+	t.Parallel()
+
+	v := mustNewValidator(t, newValidatorConfig())
+	opts := ValidatorOptions{
+		EnabledKinds: []Kind{KindNexus, KindNexusHandler},
+	}
+	sub := &commonpb.Callback_ResultSubscription{
+		RequestId:           "sub-req-1",
+		ResultFormatVersion: 1,
+		ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "wf", RunId: "run-1"},
+	}
+
+	cases := []struct {
+		name string
+		cbs  []*commonpb.Callback
+	}{
+		{
+			name: "nexus with populated result_subscription",
+			cbs: func() []*commonpb.Callback {
+				cb := newNexusCallback()
+				cb.ResultSubscription = sub
+				return []*commonpb.Callback{cb}
+			}(),
+		},
+		{
+			name: "nexus with empty result_subscription",
+			cbs: func() []*commonpb.Callback {
+				cb := newNexusCallback()
+				cb.ResultSubscription = &commonpb.Callback_ResultSubscription{}
+				return []*commonpb.Callback{cb}
+			}(),
+		},
+		{
+			name: "system url with result_subscription",
+			cbs: []*commonpb.Callback{{
+				Variant: &commonpb.Callback_Nexus_{
+					Nexus: &commonpb.Callback_Nexus{Url: nexus.SystemCallbackURL},
+				},
+				ResultSubscription: sub,
+			}},
+		},
+		{
+			name: "internal url with result_subscription",
+			cbs: []*commonpb.Callback{{
+				Variant: &commonpb.Callback_Nexus_{
+					Nexus: &commonpb.Callback_Nexus{Url: chasm.NexusCompletionHandlerURL},
+				},
+				ResultSubscription: sub,
+			}},
+		},
+		{
+			name: "nexus handler with result_subscription",
+			cbs: func() []*commonpb.Callback {
+				cb := newNexusHandlerCallback()
+				cb.ResultSubscription = sub
+				return []*commonpb.Callback{cb}
+			}(),
+		},
+		{
+			name: "unset variant with result_subscription",
+			cbs: []*commonpb.Callback{{
+				ResultSubscription: sub,
+			}},
+		},
+		{
+			name: "mixed valid and result_subscription callbacks",
+			cbs: func() []*commonpb.Callback {
+				cb := newNexusCallback()
+				cb.ResultSubscription = sub
+				return []*commonpb.Callback{newNexusCallback(), cb}
+			}(),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := v.Validate(t.Context(), "ns", tc.cbs, opts)
+			var invalidArgErr *serviceerror.InvalidArgument
+			require.ErrorAs(t, err, &invalidArgErr)
+			require.ErrorContains(t, err, "callback must not specify result_subscription")
+		})
+	}
+}
+
 func TestValidateNexusHandlerCallback(t *testing.T) {
 	ctx := context.Background()
 

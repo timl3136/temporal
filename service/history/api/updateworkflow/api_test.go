@@ -374,6 +374,28 @@ func TestApplyRequest_SkipsCallbackValidationForCompletedUpdate(t *testing.T) {
 	require.False(t, action.CreateWorkflowTask)
 }
 
+func TestValidateCallbacksRejectsResultSubscription(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	ms := newRunningMutableStateForCallbacks(ctrl)
+	ms.EXPECT().GetCompletedUpdate(gomock.Any(), gomock.Any()).Return(nil, serviceerror.NewNotFound("not found")).AnyTimes()
+	ms.EXPECT().ValidateCallbackAddition(gomock.Any(), gomock.Any()).Times(0)
+
+	req := createUpdateRequestWithCallbacks("test-update-id", "req-1")
+	req.Request.Request.CompletionCallbacks[0].ResultSubscription = &commonpb.Callback_ResultSubscription{
+		RequestId:           "sub-req-1",
+		ResultFormatVersion: 1,
+	}
+
+	updateReg := update.NewRegistry(ms)
+	updater := &Updater{req: req}
+	_, err := updater.ApplyRequest(t.Context(), updateReg, ms)
+	var invalidArg *serviceerror.InvalidArgument
+	require.ErrorAs(t, err, &invalidArg)
+	require.ErrorContains(t, err, "callback must not specify result_subscription")
+}
+
 // newRunningMutableStateForCallbacks returns a mock of a running workflow that passes every
 // admission check ahead of callback validation.
 func newRunningMutableStateForCallbacks(ctrl *gomock.Controller) *historyi.MockMutableState {

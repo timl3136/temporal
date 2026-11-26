@@ -331,3 +331,64 @@ func TestGrantEagerWorkflowDispatchVersion(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepareRejectsResultSubscriptionCallback(t *testing.T) {
+	t.Parallel()
+
+	sub := &commonpb.Callback_ResultSubscription{
+		RequestId:           "sub-req-1",
+		ResultFormatVersion: 1,
+		ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "wf", RunId: "run-1"},
+	}
+
+	cases := []struct {
+		name              string
+		onConflictOptions *workflowpb.OnConflictOptions
+	}{
+		{name: "start workflow"},
+		{
+			name: "on-conflict attach",
+			onConflictOptions: &workflowpb.OnConflictOptions{
+				AttachRequestId:           true,
+				AttachCompletionCallbacks: true,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctrl := gomock.NewController(t)
+			shardContext := historyi.NewMockShardContext(ctrl)
+			shardContext.EXPECT().GetConfig().Return(tests.NewDynamicConfig()).AnyTimes()
+			shardContext.EXPECT().GetMetricsHandler().Return(metrics.NoopMetricsHandler).AnyTimes()
+			shardContext.EXPECT().GetLogger().Return(log.NewNoopLogger()).AnyTimes()
+			shardContext.EXPECT().GetThrottledLogger().Return(log.NewNoopLogger()).AnyTimes()
+
+			cb := testCallbacks()[0]
+			cb.ResultSubscription = sub
+			starter := &Starter{
+				shardContext: shardContext,
+				namespace:    tests.LocalNamespaceEntry,
+				request: &historyservice.StartWorkflowExecutionRequest{
+					NamespaceId: tests.NamespaceID.String(),
+					StartRequest: &workflowservice.StartWorkflowExecutionRequest{
+						Namespace:           tests.Namespace.String(),
+						RequestId:           "request-id",
+						WorkflowId:          "workflow-id",
+						WorkflowType:        &commonpb.WorkflowType{Name: "workflow-type"},
+						TaskQueue:           &taskqueuepb.TaskQueue{Name: "workflow-task-queue"},
+						CompletionCallbacks: []*commonpb.Callback{cb},
+						OnConflictOptions:   tc.onConflictOptions,
+					},
+				},
+			}
+
+			err := starter.prepare(t.Context())
+			var invalidArg *serviceerror.InvalidArgument
+			require.ErrorAs(t, err, &invalidArg)
+			require.ErrorContains(t, err, "callback must not specify result_subscription")
+		})
+	}
+}

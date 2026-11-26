@@ -328,6 +328,11 @@ func ValidateStartWorkflowExecutionRequest(
 	if err := retrypolicy.Validate(request.RetryPolicy); err != nil {
 		return err
 	}
+	for _, cb := range request.GetCompletionCallbacks() {
+		if cb.GetResultSubscription() != nil {
+			return serviceerror.NewInvalidArgument("callback must not specify result_subscription")
+		}
+	}
 	return ValidateStart(
 		ctx,
 		shard,

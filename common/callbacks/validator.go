@@ -166,6 +166,10 @@ func (v *validator) ValidateAdditions(
 }
 
 func (v *validator) validateCallback(cb *commonpb.Callback, namespaceName string, opts ValidatorOptions) error {
+	if cb.GetResultSubscription() != nil {
+		return serviceerror.NewInvalidArgument("callback must not specify result_subscription")
+	}
+
 	kind := KindOf(cb)
 
 	// For unknown callbacks, prefer the "unknown callback variant" error below.

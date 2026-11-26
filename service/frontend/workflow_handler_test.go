@@ -1356,6 +1356,64 @@ func (s *WorkflowHandlerSuite) TestStartWorkflowExecution_Failed_InvalidCallback
 	s.ErrorContains(err, "workflow event link must not have an empty namespace field")
 }
 
+func (s *WorkflowHandlerSuite) TestStartWorkflowExecution_Failed_ResultSubscriptionCallback() {
+	s.mockSearchAttributesMapperProvider.EXPECT().GetMapper(gomock.Any()).AnyTimes().Return(nil, nil)
+	config := s.newConfig()
+	config.CallbackEndpointConfigs = dc.GetTypedPropertyFnFilteredByNamespace(callbacks.AddressMatchRules{
+		Rules: []callbacks.AddressMatchRule{
+			{
+				Regexp:        regexp.MustCompile(`.*`),
+				AllowInsecure: true,
+			},
+		},
+	})
+	wh := s.getWorkflowHandler(config)
+
+	sub := &commonpb.Callback_ResultSubscription{
+		RequestId:           "sub-req-1",
+		ResultFormatVersion: 1,
+		ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "workflow-id", RunId: "run-1"},
+	}
+
+	for _, tc := range []struct {
+		name              string
+		conflictPolicy    enumspb.WorkflowIdConflictPolicy
+		onConflictOptions *workflowpb.OnConflictOptions
+	}{
+		{name: "start"},
+		{
+			name:           "on-conflict attach",
+			conflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+			onConflictOptions: &workflowpb.OnConflictOptions{
+				AttachRequestId:           true,
+				AttachCompletionCallbacks: true,
+			},
+		},
+	} {
+		s.Run(tc.name, func() {
+			req := &workflowservice.StartWorkflowExecutionRequest{
+				Namespace:                "test-namespace",
+				WorkflowId:               "workflow-id",
+				WorkflowType:             &commonpb.WorkflowType{Name: "workflow-type"},
+				TaskQueue:                &taskqueuepb.TaskQueue{Name: "task-queue"},
+				RequestId:                uuid.NewString(),
+				WorkflowIdConflictPolicy: tc.conflictPolicy,
+				OnConflictOptions:        tc.onConflictOptions,
+				CompletionCallbacks: []*commonpb.Callback{
+					{
+						Variant:            nexusCallbackVariant(),
+						ResultSubscription: sub,
+					},
+				},
+			}
+			var invalidArgument *serviceerror.InvalidArgument
+			_, err := wh.StartWorkflowExecution(s.T().Context(), req)
+			s.ErrorAs(err, &invalidArgument)
+			s.ErrorContains(err, "callback must not specify result_subscription")
+		})
+	}
+}
+
 func (s *WorkflowHandlerSuite) TestStartWorkflowExecution_Failed_InvalidAggregatedLinks() {
 	s.mockSearchAttributesMapperProvider.EXPECT().GetMapper(gomock.Any()).AnyTimes().Return(nil, nil)
 	config := s.newConfig()
@@ -6875,6 +6933,24 @@ func (s *WorkflowHandlerSuite) TestPrepareUpdateWorkflowRequest_ValidatesComplet
 		var unimplemented *serviceerror.Unimplemented
 		s.ErrorAs(err, &unimplemented)
 		s.ErrorContains(err, "unknown callback variant")
+	})
+
+	s.Run("rejects result subscription metadata", func() {
+		err := wh.prepareUpdateWorkflowRequest(
+			s.T().Context(),
+			s.testNamespace,
+			newRequest([]*commonpb.Callback{{
+				Variant: nexusCallbackVariant(),
+				ResultSubscription: &commonpb.Callback_ResultSubscription{
+					RequestId:           "sub-req-1",
+					ResultFormatVersion: 1,
+				},
+			}}),
+		)
+
+		var invalidArg *serviceerror.InvalidArgument
+		s.ErrorAs(err, &invalidArg)
+		s.ErrorContains(err, "callback must not specify result_subscription")
 	})
 
 	s.Run("normalizes callback headers", func() {
