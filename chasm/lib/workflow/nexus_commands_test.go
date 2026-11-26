@@ -1201,3 +1201,75 @@ func TestScheduleGetWorkflowExecutionResult(t *testing.T) {
 		})
 	}
 }
+
+// DEC-2 and DEC-4: canceling a GetWorkflowExecutionResult operation without a token records Canceled in the same
+// transaction and never schedules a target cancel; with a token it schedules the target cancel and stays open.
+func TestCancelGetWorkflowExecutionResult(t *testing.T) {
+	svc := workflowservicenexus.TemporalAPIWorkflowserviceV1WorkflowService
+	cfg := *defaultConfig
+	cfg.MaxServiceNameLength = dynamicconfig.GetIntPropertyFnFilteredByNamespace(len(svc.ServiceName))
+	cfg.MaxOperationNameLength = dynamicconfig.GetIntPropertyFnFilteredByNamespace(len(svc.GetWorkflowExecutionResult.Name()))
+
+	for _, tc := range []struct {
+		status       nexusoperationpb.OperationStatus
+		canceledNow  bool
+		cancelStatus nexusoperationpb.CancellationStatus
+	}{
+		{status: nexusoperationpb.OPERATION_STATUS_SCHEDULED, canceledNow: true},
+		{status: nexusoperationpb.OPERATION_STATUS_BACKING_OFF, canceledNow: true},
+		{status: nexusoperationpb.OPERATION_STATUS_STARTED, cancelStatus: nexusoperationpb.CANCELLATION_STATUS_SCHEDULED},
+	} {
+		t.Run(tc.status.String(), func(t *testing.T) {
+			tcx := newTestContext(t, &cfg, callerWorkflowID)
+			tcx.chasmCtx.HandleExecutionKey = func() chasm.ExecutionKey {
+				return chasm.ExecutionKey{NamespaceID: tests.GlobalNamespaceEntry.ID().String(), BusinessID: callerWorkflowID, RunID: callerRunID}
+			}
+			serviceProcessor := chasm.NewNexusServiceProcessor(svc.ServiceName)
+			serviceProcessor.MustRegisterOperation(svc.GetWorkflowExecutionResult.Name(), NewGetWorkflowExecutionResultOperationProcessor(newResultProcessor(true).config))
+			tcx.nexusProcessor.MustRegisterServiceProcessor(serviceProcessor)
+			input, err := sdkconverter.PreferProtoDataConverter.ToPayloads(resultRequest("target", ""))
+			require.NoError(t, err)
+			require.NoError(t, tcx.scheduleHandler(tcx.chasmCtx, tcx.wf, commandValidator{maxPayloadSize: 1000}, &commandpb.Command{
+				Attributes: &commandpb.Command_ScheduleNexusOperationCommandAttributes{
+					ScheduleNexusOperationCommandAttributes: &commandpb.ScheduleNexusOperationCommandAttributes{
+						Endpoint:  commonnexus.SystemEndpoint,
+						Service:   svc.ServiceName,
+						Operation: svc.GetWorkflowExecutionResult.Name(),
+						Input:     input.Payloads[0],
+					},
+				},
+			}, CommandHandlerOptions{WorkflowTaskCompletedEventID: 1}))
+			scheduledEventID := tcx.history.Events[0].EventId
+			op := tcx.wf.Operations[scheduledEventID].Get(tcx.chasmCtx)
+			op.SetStateMachineState(tc.status)
+			if tc.status == nexusoperationpb.OPERATION_STATUS_STARTED {
+				op.OperationToken = "subscription-token"
+			}
+
+			require.NoError(t, tcx.cancelHandler(tcx.chasmCtx, tcx.wf, commandValidator{maxPayloadSize: 1}, &commandpb.Command{
+				Attributes: &commandpb.Command_RequestCancelNexusOperationCommandAttributes{
+					RequestCancelNexusOperationCommandAttributes: &commandpb.RequestCancelNexusOperationCommandAttributes{
+						ScheduledEventId: scheduledEventID,
+					},
+				},
+			}, CommandHandlerOptions{WorkflowTaskCompletedEventID: 1}))
+
+			require.NotNil(t, tcx.history.Events[1].GetNexusOperationCancelRequestedEventAttributes())
+			_, stillOpen := tcx.wf.Operations[scheduledEventID]
+			if tc.canceledNow {
+				require.Len(t, tcx.history.Events, 3)
+				canceled := tcx.history.Events[2].GetNexusOperationCanceledEventAttributes()
+				require.Equal(t, scheduledEventID, canceled.GetScheduledEventId())
+				require.NotNil(t, canceled.GetFailure().GetCause().GetCanceledFailureInfo())
+				require.False(t, stillOpen)
+				require.Equal(t, nexusoperationpb.OPERATION_STATUS_CANCELED, op.Status)
+				// A late Started reply cannot apply to the canceled operation.
+				require.False(t, nexusoperation.TransitionStarted.Possible(op))
+				return
+			}
+			require.Len(t, tcx.history.Events, 2)
+			require.True(t, stillOpen)
+			require.Equal(t, tc.cancelStatus, op.Cancellation.Get(tcx.chasmCtx).Status)
+		})
+	}
+}

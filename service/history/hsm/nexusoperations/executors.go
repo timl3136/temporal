@@ -950,7 +950,7 @@ func (e taskExecutor) loadArgsForCancelation(ctx context.Context, env hsm.Enviro
 //nolint:revive // The legacy executor is kept intact while existing HSM operations remain loadable.
 func (e taskExecutor) saveCancelationResult(ctx context.Context, env hsm.Environment, ref hsm.Ref, callErr error, scheduledEventID int64) error {
 	return env.Access(ctx, ref, hsm.AccessWrite, func(n *hsm.Node) error {
-		return hsm.MachineTransition(n, func(c Cancelation) (hsm.TransitionOutput, error) {
+		err := hsm.MachineTransition(n, func(c Cancelation) (hsm.TransitionOutput, error) {
 			if callErr != nil {
 				var handlerErr *nexus.HandlerError
 				var opTimeoutBelowMinErr *operationTimeoutBelowMinError
@@ -1010,6 +1010,18 @@ func (e taskExecutor) saveCancelationResult(ctx context.Context, env hsm.Environ
 				Node: n,
 			})
 		})
+		if err != nil || callErr != nil {
+			return err
+		}
+		op, err := hsm.MachineData[Operation](n.Parent)
+		if err != nil {
+			return err
+		}
+		// The target acknowledged removing the subscription and will never report it back (DEC-4).
+		if commonnexus.IsGetWorkflowExecutionResult(op.Endpoint, op.Service, op.Operation) {
+			return RecordCanceled(n.Parent, commonnexus.ResultSubscriptionCanceledFailure())
+		}
+		return nil
 	})
 }
 

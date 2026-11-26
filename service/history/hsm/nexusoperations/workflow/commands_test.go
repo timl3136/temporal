@@ -18,6 +18,7 @@ import (
 	"go.temporal.io/api/workflowservice/v1/workflowservicenexus"
 	"go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
+	tokenspb "go.temporal.io/server/api/token/v1"
 	"go.temporal.io/server/chasm"
 	chasmnexus "go.temporal.io/server/chasm/lib/nexusoperation"
 	testlib "go.temporal.io/server/chasm/lib/tests"
@@ -36,6 +37,7 @@ import (
 	"go.temporal.io/server/service/history/tests"
 	"go.temporal.io/server/service/history/workflow"
 	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -117,6 +119,7 @@ func newTestContext(t *testing.T, cfg *nexusoperations.Config) testContext {
 	history := &historypb.History{}
 	ms.EXPECT().AddHistoryEvent(gomock.Any(), gomock.Any()).DoAndReturn(func(t enumspb.EventType, setAttrs func(he *historypb.HistoryEvent)) *historypb.HistoryEvent {
 		e := &historypb.HistoryEvent{
+			EventType: t,
 			Version:   1,
 			EventId:   lastEventID,
 			EventTime: timestamppb.Now(),
@@ -126,7 +129,9 @@ func newTestContext(t *testing.T, cfg *nexusoperations.Config) testContext {
 		history.Events = append(history.Events, e)
 		return e
 	}).AnyTimes()
-	ms.EXPECT().GenerateEventLoadToken(gomock.Any()).Return([]byte("token"), nil).AnyTimes()
+	ms.EXPECT().GenerateEventLoadToken(gomock.Any()).DoAndReturn(func(e *historypb.HistoryEvent) ([]byte, error) {
+		return proto.Marshal(&tokenspb.HistoryEventRef{EventId: e.EventId, EventBatchId: e.EventId})
+	}).AnyTimes()
 
 	execInfo := &persistencespb.WorkflowExecutionInfo{}
 	execState := &persistencespb.WorkflowExecutionState{}

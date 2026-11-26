@@ -327,7 +327,18 @@ func (ch *nexusCommandHandler) handleCancelCommand(
 		// own hsm.ErrStateMachineNotFound tolerance for the same race, in nexusoperations/workflow/commands.go.)
 		return nil
 	}
-	return err
+	if err != nil || !operationFound {
+		return err
+	}
+	// A GetWorkflowExecutionResult subscription that has no token yet is canceled in this transaction and is never
+	// canceled at the target (DEC-2): a late start reply finds no operation and is dropped, and a late attach stays
+	// until the target closes.
+	op := wf.Operations[attrs.ScheduledEventId].Get(ctx)
+	if commonnexus.IsGetWorkflowExecutionResult(op.GetEndpoint(), op.GetService(), op.GetOperation()) &&
+		nexusoperation.TransitionStarted.Possible(op) {
+		return wf.OnNexusOperationCanceled(ctx, op, commonnexus.ResultSubscriptionCanceledFailure())
+	}
+	return nil
 }
 
 func makeNexusOperationTerminalEventFilter(scheduledEventID int64) func(event *historypb.HistoryEvent) bool {

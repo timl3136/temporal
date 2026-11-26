@@ -368,8 +368,21 @@ func (ch *commandHandler) HandleCancelCommand(
 		// This may happen if there's a buffered completion. Ignore.
 		return nil
 	}
-
-	return err
+	if err != nil || node == nil {
+		return err
+	}
+	// A GetWorkflowExecutionResult subscription that has no token yet is canceled in this transaction and is never
+	// canceled at the target (DEC-2): a late start reply finds no operation and is dropped, and a late attach stays
+	// until the target closes.
+	op, err := hsm.MachineData[nexusoperations.Operation](node)
+	if err != nil {
+		return err
+	}
+	if commonnexus.IsGetWorkflowExecutionResult(op.Endpoint, op.Service, op.Operation) &&
+		nexusoperations.TransitionStarted.Possible(op) {
+		return nexusoperations.RecordCanceled(node, commonnexus.ResultSubscriptionCanceledFailure())
+	}
+	return nil
 }
 
 func RegisterCommandHandlers(

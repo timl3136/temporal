@@ -9,6 +9,7 @@ import (
 	"github.com/nexus-rpc/sdk-go/nexus"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	failurepb "go.temporal.io/api/failure/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/serviceerror"
 	chasmnexus "go.temporal.io/server/chasm/lib/nexusoperation"
@@ -73,25 +74,41 @@ func handleOperationError(
 
 		return FailedEventDefinition{}.Apply(node.Parent, event)
 	case nexus.OperationStateCanceled:
-		originalCause = commonnexus.CoerceToCanceledFailure(originalCause)
-		event := node.AddHistoryEvent(enumspb.EVENT_TYPE_NEXUS_OPERATION_CANCELED, func(e *historypb.HistoryEvent) {
-			// We must assign to this property, linter doesn't like this.
-			// nolint:revive
-			e.Attributes = &historypb.HistoryEvent_NexusOperationCanceledEventAttributes{
-				NexusOperationCanceledEventAttributes: &historypb.NexusOperationCanceledEventAttributes{
-					Failure:          createNexusOperationFailure(operation, eventID, originalCause),
-					ScheduledEventId: eventID,
-					RequestId:        operation.RequestId,
-				},
-			}
-		})
-
-		return CanceledEventDefinition{}.Apply(node.Parent, event)
+		return recordCanceled(node, operation, eventID, commonnexus.CoerceToCanceledFailure(originalCause))
 	default:
 		// Both the Nexus Client and CompletionHandler reject invalid states, but just in case, we return this as a
 		// transition error.
 		return fmt.Errorf("unexpected operation state: %v", opErr.State)
 	}
+}
+
+// RecordCanceled adds a NexusOperationCanceled event with the given cause to the operation node and applies it, which
+// deletes the node. Used when the caller decides the outcome itself rather than receiving it from the handler.
+func RecordCanceled(node *hsm.Node, cause *failurepb.Failure) error {
+	operation, err := hsm.MachineData[Operation](node)
+	if err != nil {
+		return err
+	}
+	eventID, err := hsm.EventIDFromToken(operation.ScheduledEventToken)
+	if err != nil {
+		return err
+	}
+	return recordCanceled(node, operation, eventID, cause)
+}
+
+func recordCanceled(node *hsm.Node, operation Operation, eventID int64, cause *failurepb.Failure) error {
+	event := node.AddHistoryEvent(enumspb.EVENT_TYPE_NEXUS_OPERATION_CANCELED, func(e *historypb.HistoryEvent) {
+		// We must assign to this property, linter doesn't like this.
+		// nolint:revive
+		e.Attributes = &historypb.HistoryEvent_NexusOperationCanceledEventAttributes{
+			NexusOperationCanceledEventAttributes: &historypb.NexusOperationCanceledEventAttributes{
+				Failure:          createNexusOperationFailure(operation, eventID, cause),
+				ScheduledEventId: eventID,
+				RequestId:        operation.RequestId,
+			},
+		}
+	})
+	return CanceledEventDefinition{}.Apply(node.Parent, event)
 }
 
 // fabricateStartedEventIfMissing adds a NEXUS_OPERATION_STARTED history event and transitions the
