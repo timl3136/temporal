@@ -31,6 +31,12 @@ func TestWorkflowResultFromCloseEventSuccess(t *testing.T) {
 		Data:     stored.Data,
 	}
 
+	// An absent result must equal what the HTTP completion path decodes for an empty result.
+	content, err := PayloadSerializer.Serialize((*commonpb.Payload)(nil))
+	require.NoError(t, err)
+	var httpAbsent *commonpb.Payload
+	require.NoError(t, PayloadSerializer.Deserialize(content, &httpAbsent))
+
 	for _, tc := range []struct {
 		name      string
 		values    []*commonpb.Payload
@@ -38,7 +44,7 @@ func TestWorkflowResultFromCloseEventSuccess(t *testing.T) {
 		want      *commonpb.Payload
 		rejection string
 	}{
-		{name: "absent", limit: 1024},
+		{name: "absent", limit: 1024, want: httpAbsent},
 		{name: "present empty payload", values: []*commonpb.Payload{{}}, limit: 1024, want: &commonpb.Payload{}},
 		{name: "encrypted payload", values: []*commonpb.Payload{stored}, limit: 1024, want: stored},
 		{name: "arbitrary binary metadata", values: []*commonpb.Payload{withBinaryMetadata}, limit: 1024, want: withBinaryMetadata},

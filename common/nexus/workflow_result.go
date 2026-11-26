@@ -18,7 +18,8 @@ const GetWorkflowExecutionResultOperation = "GetWorkflowExecutionResult"
 
 // WorkflowResultFromCloseEvent converts a terminal workflow event into a detached Nexus outcome.
 // The limit applies to the serialized Temporal payload or failure, including metadata and nested causes.
-// A nil payload and no errors means the workflow completed without a result.
+// A workflow that completed without a result yields a binary/null payload, the same value the
+// Nexus HTTP completion path decodes for an empty result, so both delivery paths match.
 func WorkflowResultFromCloseEvent(event *historypb.HistoryEvent, limit int) (*commonpb.Payload, *nexus.OperationError, error) {
 	var cause *failurepb.Failure
 	switch event.GetEventType() {
@@ -30,7 +31,7 @@ func WorkflowResultFromCloseEvent(event *historypb.HistoryEvent, limit int) (*co
 		values := attrs.GetResult().GetPayloads()
 		switch len(values) {
 		case 0:
-			return nil, nil, nil
+			return &commonpb.Payload{Metadata: map[string][]byte{"encoding": []byte("binary/null")}}, nil, nil
 		case 1:
 			if proto.Size(values[0]) > limit {
 				cause = failure.NewServerFailure("workflow result exceeds the size limit", true)
