@@ -377,4 +377,3 @@ func TestOtherOperationKeepsDeferredCancel(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, enumsspb.NEXUS_OPERATION_STATE_STARTED, op.State(), "the handler reports the outcome")
 }
-
