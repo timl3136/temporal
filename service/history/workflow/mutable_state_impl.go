@@ -40,6 +40,7 @@ import (
 	chasmworkflow "go.temporal.io/server/chasm/lib/workflow"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/backoff"
+	commoncallbacks "go.temporal.io/server/common/callbacks"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/contextutil"
@@ -911,8 +912,6 @@ func nexusCompleteOperationFailure(
 	}, nil
 }
 
-const resultSubscriptionFormatVersionV1 int32 = 1
-
 func (ms *MutableStateImpl) nexusCompletionLink(requestID string) nexus.Link {
 	// Create the link information about the workflow to be attached to fabricated started event if completion is
 	// received before start response.
@@ -948,9 +947,7 @@ func (ms *MutableStateImpl) resultSubscriptionCompletionLink(
 	requestID string,
 	sub *commonpb.Callback_ResultSubscription,
 ) nexus.Link {
-	if resolved := sub.GetResolvedExecution(); sub.GetRequestId() != "" &&
-		resolved.GetWorkflowId() != "" &&
-		resolved.GetRunId() != "" {
+	if resolved := sub.GetResolvedExecution(); resolved.GetWorkflowId() != "" && resolved.GetRunId() != "" {
 		return commonnexus.ConvertLinkWorkflowEventToNexusLink(&commonpb.Link_WorkflowEvent{
 			Namespace:  ms.namespaceEntry.Name().String(),
 			WorkflowId: resolved.GetWorkflowId(),
@@ -966,6 +963,21 @@ func (ms *MutableStateImpl) resultSubscriptionCompletionLink(
 	return ms.nexusCompletionLink(requestID)
 }
 
+func closeEventHasSuccessor(event *historypb.HistoryEvent) bool {
+	switch event.GetEventType() {
+	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED:
+		return event.GetWorkflowExecutionCompletedEventAttributes().GetNewExecutionRunId() != ""
+	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED:
+		return event.GetWorkflowExecutionFailedEventAttributes().GetNewExecutionRunId() != ""
+	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TIMED_OUT:
+		return event.GetWorkflowExecutionTimedOutEventAttributes().GetNewExecutionRunId() != ""
+	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW:
+		return true
+	default:
+		return false
+	}
+}
+
 // GetResultSubscriptionCompletion converts a workflow close event into a same-namespace Nexus
 // completion for a server-authored GetWorkflowExecutionResult subscription.
 func (ms *MutableStateImpl) GetResultSubscriptionCompletion(
@@ -973,19 +985,16 @@ func (ms *MutableStateImpl) GetResultSubscriptionCompletion(
 	requestID string,
 	sub *commonpb.Callback_ResultSubscription,
 ) (nexusrpc.CompleteOperationOptions, error) {
-	if sub == nil || sub.GetResultFormatVersion() != resultSubscriptionFormatVersionV1 {
-		return nexusrpc.CompleteOperationOptions{}, serviceerror.NewInternalf(
-			"unsupported result subscription format version: %d",
-			sub.GetResultFormatVersion(),
-		)
-	}
-	if sub.GetRequestId() == "" {
-		return nexusrpc.CompleteOperationOptions{}, serviceerror.NewInternal("result subscription missing request ID")
-	}
-
 	ce, err := ms.GetCompletionEvent(ctx)
 	if err != nil {
 		return nexusrpc.CompleteOperationOptions{}, err
+	}
+	if closeEventHasSuccessor(ce) {
+		return nexusrpc.CompleteOperationOptions{}, fmt.Errorf(
+			"%w: %v",
+			commoncallbacks.ErrResultSubscriptionNonTerminalClose,
+			ce.GetEventType(),
+		)
 	}
 
 	limit := ms.config.BlobSizeLimitError(ms.namespaceEntry.Name().String())
@@ -1001,7 +1010,7 @@ func (ms *MutableStateImpl) GetResultSubscriptionCompletion(
 	}
 	if opErr != nil {
 		opts.Error = opErr
-	} else if result != nil {
+	} else {
 		opts.Result = result
 	}
 	return opts, nil

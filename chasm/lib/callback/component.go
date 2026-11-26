@@ -17,6 +17,7 @@ import (
 	callbackspb "go.temporal.io/server/chasm/lib/callback/gen/callbackpb/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/backoff"
+	commoncallbacks "go.temporal.io/server/common/callbacks"
 	"go.temporal.io/server/common/log/tag"
 	commonnexus "go.temporal.io/server/common/nexus"
 	"go.temporal.io/server/common/nexus/nexusrpc"
@@ -24,8 +25,6 @@ import (
 	queueserrors "go.temporal.io/server/service/history/queues/errors"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
-
-const resultSubscriptionFormatVersionV1 int32 = 1
 
 // CompletionSource is the interface different kinds of executions implement so that their result can be
 // delivered to waiting callback handlers.
@@ -119,8 +118,14 @@ func (c *Callback) loadInvocationArgs(
 	var completion nexusrpc.CompleteOperationOptions
 	var err error
 	if sub != nil {
-		if err := validateResultSubscriptionForDelivery(c.GetCallback(), sub); err != nil {
-			return nil, err
+		nexusCB := c.GetCallback().GetNexus()
+		if nexusCB == nil {
+			return nil, queueserrors.NewUnprocessableTaskError(
+				fmt.Sprintf("unsupported callback variant for result subscription: %T", c.GetCallback().GetVariant()),
+			)
+		}
+		if err := commoncallbacks.ValidateResultSubscriptionForDelivery(nexusCB.GetUrl(), sub); err != nil {
+			return nil, queueserrors.NewUnprocessableTaskError(err.Error())
 		}
 		resultSource, ok := target.(ResultSubscriptionCompletionSource)
 		if !ok {
@@ -129,6 +134,9 @@ func (c *Callback) loadInvocationArgs(
 			)
 		}
 		completion, err = resultSource.GetResultSubscriptionCompletion(ctx, c.RequestId, sub)
+		if errors.Is(err, commoncallbacks.ErrResultSubscriptionNonTerminalClose) {
+			return nil, fmt.Errorf("%w: %w", queueserrors.NewUnprocessableTaskError("result subscription close event has a successor"), err)
+		}
 	} else {
 		completion, err = target.GetNexusCompletion(ctx, c.RequestId)
 	}
@@ -193,32 +201,6 @@ func (c *Callback) loadInvocationArgs(
 		requestID:           deliveryRequestID,
 		attempt:             c.Attempt,
 	}, nil
-}
-
-func validateResultSubscriptionForDelivery(
-	cb *callbackspb.Callback,
-	sub *commonpb.Callback_ResultSubscription,
-) error {
-	if sub.GetResultFormatVersion() != resultSubscriptionFormatVersionV1 {
-		return queueserrors.NewUnprocessableTaskError(
-			fmt.Sprintf("unsupported result subscription format version: %d", sub.GetResultFormatVersion()),
-		)
-	}
-	if sub.GetRequestId() == "" {
-		return queueserrors.NewUnprocessableTaskError("result subscription callback missing request ID")
-	}
-	nexusCB := cb.GetNexus()
-	if nexusCB == nil {
-		return queueserrors.NewUnprocessableTaskError(
-			fmt.Sprintf("unsupported callback variant for result subscription: %T", cb.GetVariant()),
-		)
-	}
-	if nexusCB.GetUrl() != commonnexus.SystemCallbackURL && nexusCB.GetUrl() != chasm.NexusCompletionHandlerURL {
-		return queueserrors.NewUnprocessableTaskError(
-			fmt.Sprintf("unsupported callback URL for result subscription: %q", nexusCB.GetUrl()),
-		)
-	}
-	return nil
 }
 
 // recordHandlerLinks stores the links the callback's target returned when it accepted the delivery.

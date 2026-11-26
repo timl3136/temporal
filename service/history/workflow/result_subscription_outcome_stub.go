@@ -16,6 +16,8 @@ import (
 
 // workflowResultFromCloseEvent stubs commonnexus.WorkflowResultFromCloseEvent with branch B's exact
 // signature and behavior until server/result-outcome lands on mainline.
+// A workflow that completed without a result yields a binary/null payload, the same value the
+// Nexus HTTP completion path decodes for an empty result, so both delivery paths match.
 //
 // When rebasing onto mainline after branch B lands, delete this file and call
 // commonnexus.WorkflowResultFromCloseEvent directly in MutableStateImpl.GetResultSubscriptionCompletion.
@@ -30,7 +32,7 @@ func workflowResultFromCloseEvent(event *historypb.HistoryEvent, limit int) (*co
 		values := attrs.GetResult().GetPayloads()
 		switch len(values) {
 		case 0:
-			return nil, nil, nil
+			return &commonpb.Payload{Metadata: map[string][]byte{"encoding": []byte("binary/null")}}, nil, nil
 		case 1:
 			if proto.Size(values[0]) > limit {
 				cause = failure.NewServerFailure("workflow result exceeds the size limit", true)

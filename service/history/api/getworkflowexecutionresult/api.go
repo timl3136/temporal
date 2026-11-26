@@ -21,6 +21,7 @@ import (
 	chasmcallback "go.temporal.io/server/chasm/lib/callback"
 	chasmworkflow "go.temporal.io/server/chasm/lib/workflow"
 	"go.temporal.io/server/common"
+	commoncallbacks "go.temporal.io/server/common/callbacks"
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/namespace"
 	commonnexus "go.temporal.io/server/common/nexus"
@@ -34,10 +35,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-const (
-	resultSubscriptionTokenVersion int32 = 1
-	resultFormatVersionV1          int32 = 1
-)
+const resultSubscriptionTokenVersion int32 = 1
 
 type StartRequest struct {
 	NamespaceID namespace.ID                    // trusted, from the invocation envelope
@@ -166,7 +164,7 @@ func attachResultSubscriptionOnLease(
 	cb := common.CloneProto(req.Callback)
 	cb.ResultSubscription = &commonpb.Callback_ResultSubscription{
 		RequestId:           req.RequestID,
-		ResultFormatVersion: resultFormatVersionV1,
+		ResultFormatVersion: commoncallbacks.ResultSubscriptionFormatVersionV1,
 		ResolvedExecution: &commonpb.WorkflowExecution{
 			WorkflowId: target.workflowKey.WorkflowID,
 			RunId:      target.workflowKey.RunID,

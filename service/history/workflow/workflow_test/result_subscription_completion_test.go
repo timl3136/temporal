@@ -19,10 +19,10 @@ import (
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	enumsspb "go.temporal.io/server/api/enums/v1"
+	commoncallbacks "go.temporal.io/server/common/callbacks"
 	"go.temporal.io/server/common/dynamicconfig"
 	commonnexus "go.temporal.io/server/common/nexus"
 	"go.temporal.io/server/common/nexus/nexusrpc"
-	"go.temporal.io/server/common/payload"
 	"go.temporal.io/server/common/testing/protorequire"
 	historyi "go.temporal.io/server/service/history/interfaces"
 	"go.temporal.io/server/service/history/tests"
@@ -191,13 +191,16 @@ func TestGetResultSubscriptionCompletion_FixturesAndLegacyIsolation(t *testing.T
 			TimeoutFailureInfo: &failurepb.TimeoutFailureInfo{TimeoutType: enumspb.TIMEOUT_TYPE_START_TO_CLOSE},
 		},
 	}
+	absentContent, err := commonnexus.PayloadSerializer.Serialize((*commonpb.Payload)(nil))
+	require.NoError(t, err)
+	var httpAbsent *commonpb.Payload
+	require.NoError(t, commonnexus.PayloadSerializer.Deserialize(absentContent, &httpAbsent))
 
 	cases := []struct {
 		name               string
 		blobLimit          int
 		closeWorkflow      func(historyi.MutableState) (*historypb.HistoryEvent, error)
 		wantPayload        *commonpb.Payload
-		wantAbsentPayload  bool
 		wantState          nexus.OperationState
 		wantFailure        *failurepb.Failure
 		wantRejectionMsg   string
@@ -209,7 +212,7 @@ func TestGetResultSubscriptionCompletion_FixturesAndLegacyIsolation(t *testing.T
 			closeWorkflow: func(ms historyi.MutableState) (*historypb.HistoryEvent, error) {
 				return ms.AddCompletedWorkflowEvent(ms.GetNextEventID(), &commandpb.CompleteWorkflowExecutionCommandAttributes{}, "")
 			},
-			wantAbsentPayload: true,
+			wantPayload: httpAbsent,
 			verifyLegacyOnSame: func(t *testing.T, legacy nexusrpc.CompleteOperationOptions) {
 				require.Nil(t, legacy.Error)
 				require.Nil(t, legacy.Result)
@@ -447,14 +450,6 @@ func TestGetResultSubscriptionCompletion_FixturesAndLegacyIsolation(t *testing.T
 				chasmFailure, hsmFailure := decodeHTTPFailureAsCHASMAndHSM(t, wire.state, wire.opErr)
 				protorequire.ProtoEqual(t, syncFailure, chasmFailure)
 				protorequire.ProtoEqual(t, syncFailure, hsmFailure)
-			} else if tc.wantAbsentPayload {
-				require.Nil(t, completion.Error)
-				require.Nil(t, completion.Result)
-				require.Equal(t, nexus.OperationStateSucceeded, wire.state)
-				// Over HTTP, PayloadSerializer represents nil as binary/null.
-				wantNull, err := payload.Encode(nil)
-				require.NoError(t, err)
-				protorequire.ProtoEqual(t, wantNull, wire.payload)
 			} else {
 				require.Nil(t, completion.Error)
 				gotPayload, ok := completion.Result.(*commonpb.Payload)
@@ -463,7 +458,7 @@ func TestGetResultSubscriptionCompletion_FixturesAndLegacyIsolation(t *testing.T
 				require.NotSame(t, tc.wantPayload, gotPayload)
 
 				require.Equal(t, nexus.OperationStateSucceeded, wire.state)
-				protorequire.ProtoEqual(t, tc.wantPayload, wire.payload)
+				protorequire.ProtoEqual(t, gotPayload, wire.payload)
 			}
 
 			if tc.verifyLegacyOnSame != nil {
@@ -477,29 +472,6 @@ func TestGetResultSubscriptionCompletion_FixturesAndLegacyIsolation(t *testing.T
 
 func TestGetResultSubscriptionCompletion_Errors(t *testing.T) {
 	t.Parallel()
-
-	t.Run("unsupported format versions and missing metadata", func(t *testing.T) {
-		t.Parallel()
-		nsEntry := tests.LocalNamespaceEntry
-		ms, _, _ := createMutableState(t, nsEntry, tests.NewDynamicConfig())
-		startWorkflowExecution(t, ms, nsEntry)
-
-		for _, tc := range []struct {
-			name string
-			sub  *commonpb.Callback_ResultSubscription
-		}{
-			{name: "nil subscription"},
-			{name: "version 0", sub: &commonpb.Callback_ResultSubscription{RequestId: "r1", ResultFormatVersion: 0}},
-			{name: "version 2", sub: &commonpb.Callback_ResultSubscription{RequestId: "r1", ResultFormatVersion: 2}},
-			{name: "empty request ID", sub: &commonpb.Callback_ResultSubscription{ResultFormatVersion: 1}},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
-				_, err := ms.GetResultSubscriptionCompletion(t.Context(), "r1", tc.sub)
-				var internalErr *serviceerror.Internal
-				require.ErrorAs(t, err, &internalErr)
-			})
-		}
-	})
 
 	t.Run("transient completion event read error propagates", func(t *testing.T) {
 		t.Parallel()
@@ -517,7 +489,7 @@ func TestGetResultSubscriptionCompletion_Errors(t *testing.T) {
 
 		sub := &commonpb.Callback_ResultSubscription{
 			RequestId:           "sub-req-1",
-			ResultFormatVersion: 1,
+			ResultFormatVersion: commoncallbacks.ResultSubscriptionFormatVersionV1,
 		}
 		_, err = ms.GetResultSubscriptionCompletion(t.Context(), "sub-req-1", sub)
 		require.ErrorIs(t, err, transientErr)
@@ -542,7 +514,7 @@ func TestGetResultSubscriptionCompletion_Errors(t *testing.T) {
 
 		sub := &commonpb.Callback_ResultSubscription{
 			RequestId:           "direct-attach-req",
-			ResultFormatVersion: 1,
+			ResultFormatVersion: commoncallbacks.ResultSubscriptionFormatVersionV1,
 		}
 		completion, err := ms.GetResultSubscriptionCompletion(t.Context(), "direct-attach-req", sub)
 		require.NoError(t, err)
@@ -562,25 +534,72 @@ func TestGetResultSubscriptionCompletion_Errors(t *testing.T) {
 		}, gotLink)
 	})
 
-	t.Run("non-terminal close event pointing to successor returns internal error", func(t *testing.T) {
-		t.Parallel()
-		nsEntry := tests.LocalNamespaceEntry
-		ms, eventsCache, _ := createMutableState(t, nsEntry, tests.NewDynamicConfig())
-		startWorkflowExecution(t, ms, nsEntry)
-		completeFirstWorkflowTask(t, ms)
+	for _, tc := range []struct {
+		name          string
+		closeWorkflow func(historyi.MutableState) (*historypb.HistoryEvent, error)
+	}{
+		{
+			name: "cron completed with successor",
+			closeWorkflow: func(ms historyi.MutableState) (*historypb.HistoryEvent, error) {
+				return ms.AddCompletedWorkflowEvent(ms.GetNextEventID(), &commandpb.CompleteWorkflowExecutionCommandAttributes{}, "next-run-id")
+			},
+		},
+		{
+			name: "failed with retry successor",
+			closeWorkflow: func(ms historyi.MutableState) (*historypb.HistoryEvent, error) {
+				return ms.AddFailWorkflowEvent(ms.GetNextEventID(), enumspb.RETRY_STATE_IN_PROGRESS, &commandpb.FailWorkflowExecutionCommandAttributes{
+					Failure: &failurepb.Failure{Message: "retryable"},
+				}, "next-run-id")
+			},
+		},
+		{
+			name: "timed out with retry successor",
+			closeWorkflow: func(ms historyi.MutableState) (*historypb.HistoryEvent, error) {
+				return ms.AddTimeoutWorkflowEvent(enumspb.RETRY_STATE_IN_PROGRESS, "next-run-id")
+			},
+		},
+		{
+			name: "continued as new",
+			closeWorkflow: func(ms historyi.MutableState) (*historypb.HistoryEvent, error) {
+				ev, err := ms.AddCompletedWorkflowEvent(ms.GetNextEventID(), &commandpb.CompleteWorkflowExecutionCommandAttributes{}, "next-run-id")
+				if err != nil {
+					return nil, err
+				}
+				return &historypb.HistoryEvent{
+					EventId:   ev.EventId,
+					EventTime: ev.EventTime,
+					Version:   ev.Version,
+					EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW,
+					Attributes: &historypb.HistoryEvent_WorkflowExecutionContinuedAsNewEventAttributes{
+						WorkflowExecutionContinuedAsNewEventAttributes: &historypb.WorkflowExecutionContinuedAsNewEventAttributes{
+							NewExecutionRunId: "next-run-id",
+						},
+					},
+				}, nil
+			},
+		},
+	} {
+		t.Run("non-terminal close event pointing to successor returns permanent sentinel/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			nsEntry := tests.LocalNamespaceEntry
+			ms, eventsCache, _ := createMutableState(t, nsEntry, tests.NewDynamicConfig())
+			startWorkflowExecution(t, ms, nsEntry)
+			completeFirstWorkflowTask(t, ms)
 
-		event, err := ms.AddCompletedWorkflowEvent(ms.GetNextEventID(), &commandpb.CompleteWorkflowExecutionCommandAttributes{}, "next-run-id")
-		require.NoError(t, err)
-		sealMutableState(t, ms, event)
+			event, err := tc.closeWorkflow(ms)
+			require.NoError(t, err)
+			sealMutableState(t, ms, event)
 
-		eventsCache.EXPECT().GetEvent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(event, nil).Times(1)
+			eventsCache.EXPECT().GetEvent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(event, nil).Times(1)
 
-		sub := &commonpb.Callback_ResultSubscription{
-			RequestId:           "sub-req-1",
-			ResultFormatVersion: 1,
-		}
-		_, err = ms.GetResultSubscriptionCompletion(t.Context(), "sub-req-1", sub)
-		var internalErr *serviceerror.Internal
-		require.ErrorAs(t, err, &internalErr)
-	})
+			sub := &commonpb.Callback_ResultSubscription{
+				RequestId:           "sub-req-1",
+				ResultFormatVersion: commoncallbacks.ResultSubscriptionFormatVersionV1,
+			}
+			_, err = ms.GetResultSubscriptionCompletion(t.Context(), "sub-req-1", sub)
+			require.ErrorIs(t, err, commoncallbacks.ErrResultSubscriptionNonTerminalClose)
+			var internalErr *serviceerror.Internal
+			require.NotErrorAs(t, err, &internalErr)
+		})
+	}
 }

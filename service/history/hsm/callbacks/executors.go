@@ -3,12 +3,12 @@ package callbacks
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
-	commonpb "go.temporal.io/api/common/v1"
-	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
+	commoncallbacks "go.temporal.io/server/common/callbacks"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
@@ -21,8 +21,6 @@ import (
 	queueserrors "go.temporal.io/server/service/history/queues/errors"
 	"go.uber.org/fx"
 )
-
-const resultSubscriptionFormatVersionV1 int32 = 1
 
 // HTTPCaller is a method that can be used to invoke HTTP requests.
 type HTTPCaller func(*http.Request) (*http.Response, error)
@@ -158,8 +156,8 @@ func (e taskExecutor) loadInvocationArgs(
 		sub := callback.GetCallback().GetResultSubscription()
 		var completion nexusrpc.CompleteOperationOptions
 		if sub != nil {
-			if err := validateResultSubscriptionForDelivery(variant, sub); err != nil {
-				return err
+			if err := commoncallbacks.ValidateResultSubscriptionForDelivery(variant.GetUrl(), sub); err != nil {
+				return queueserrors.NewUnprocessableTaskError(err.Error())
 			}
 			resultTarget, err := hsm.MachineData[CanGetResultSubscriptionCompletion](node.Parent)
 			if err != nil {
@@ -168,6 +166,9 @@ func (e taskExecutor) loadInvocationArgs(
 				)
 			}
 			completion, err = resultTarget.GetResultSubscriptionCompletion(ctx, callback.GetRequestId(), sub)
+			if errors.Is(err, commoncallbacks.ErrResultSubscriptionNonTerminalClose) {
+				return fmt.Errorf("%w: %w", queueserrors.NewUnprocessableTaskError("result subscription close event has a successor"), err)
+			}
 			if err != nil {
 				return err
 			}
@@ -206,26 +207,6 @@ func (e taskExecutor) loadInvocationArgs(
 		return nil
 	})
 	return
-}
-
-func validateResultSubscriptionForDelivery(
-	variant *persistencespb.Callback_Nexus,
-	sub *commonpb.Callback_ResultSubscription,
-) error {
-	if sub.GetResultFormatVersion() != resultSubscriptionFormatVersionV1 {
-		return queueserrors.NewUnprocessableTaskError(
-			fmt.Sprintf("unsupported result subscription format version: %d", sub.GetResultFormatVersion()),
-		)
-	}
-	if sub.GetRequestId() == "" {
-		return queueserrors.NewUnprocessableTaskError("result subscription callback missing request ID")
-	}
-	if variant.GetUrl() != commonnexus.SystemCallbackURL && variant.GetUrl() != chasm.NexusCompletionHandlerURL {
-		return queueserrors.NewUnprocessableTaskError(
-			fmt.Sprintf("unsupported callback URL for result subscription: %q", variant.GetUrl()),
-		)
-	}
-	return nil
 }
 
 func (e taskExecutor) saveResult(

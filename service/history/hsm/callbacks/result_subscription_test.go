@@ -14,12 +14,14 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	failurepb "go.temporal.io/api/failure/v1"
+	"go.temporal.io/api/serviceerror"
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	"go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/api/historyservicemock/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/backoff"
+	commoncallbacks "go.temporal.io/server/common/callbacks"
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
@@ -27,7 +29,6 @@ import (
 	"go.temporal.io/server/common/namespace"
 	commonnexus "go.temporal.io/server/common/nexus"
 	"go.temporal.io/server/common/nexus/nexusrpc"
-	"go.temporal.io/server/common/payload"
 	"go.temporal.io/server/common/testing/protorequire"
 	"go.temporal.io/server/common/testing/testlogger"
 	"go.temporal.io/server/service/history/hsm"
@@ -45,6 +46,7 @@ import (
 type dualMutableState struct {
 	legacyCompletion nexusrpc.CompleteOperationOptions
 	subCompletion    nexusrpc.CompleteOperationOptions
+	subErr           error
 	legacyCalls      []string
 	subCalls         []struct {
 		requestID string
@@ -66,7 +68,7 @@ func (ms *dualMutableState) GetResultSubscriptionCompletion(
 		requestID string
 		sub       *commonpb.Callback_ResultSubscription
 	}{requestID: requestID, sub: sub})
-	return ms.subCompletion, nil
+	return ms.subCompletion, ms.subErr
 }
 
 func newHSMTestNamespace(t *testing.T) *namespace.Namespace {
@@ -552,14 +554,12 @@ func TestProcessInvocationTask_ResultSubscription_WireParity(t *testing.T) {
 	encodedToken := base64.RawURLEncoding.EncodeToString(refBytes)
 
 	for _, tc := range []struct {
-		name        string
-		result      *commonpb.Payload
-		absent      bool
-		failure     *failurepb.Failure
-		state       nexus.OperationState
-		wantHTTPNil bool
+		name    string
+		result  *commonpb.Payload
+		failure *failurepb.Failure
+		state   nexus.OperationState
 	}{
-		{name: "absent payload", absent: true, state: nexus.OperationStateSucceeded, wantHTTPNil: true},
+		{name: "absent payload", result: &commonpb.Payload{Metadata: map[string][]byte{"encoding": []byte("binary/null")}}, state: nexus.OperationStateSucceeded},
 		{name: "present empty payload", result: &commonpb.Payload{}, state: nexus.OperationStateSucceeded},
 		{name: "raw encrypted payload", result: stored, state: nexus.OperationStateSucceeded},
 		{name: "failed", failure: failedCause, state: nexus.OperationStateFailed},
@@ -577,7 +577,7 @@ func TestProcessInvocationTask_ResultSubscription_WireParity(t *testing.T) {
 			}
 			if tc.failure != nil {
 				opts.Error = makeWrappedOpErr(t, tc.state, tc.failure)
-			} else if !tc.absent {
+			} else {
 				opts.Result = tc.result
 			}
 
@@ -668,14 +668,61 @@ func TestProcessInvocationTask_ResultSubscription_WireParity(t *testing.T) {
 				require.NoError(t, err)
 				protorequire.ProtoEqual(t, syncFailure, httpFailure)
 				protorequire.ProtoEqual(t, syncFailure, gotChasmReq.GetFailure())
-			} else if tc.wantHTTPNil {
-				wantNull, err := payload.Encode(nil)
-				require.NoError(t, err)
-				protorequire.ProtoEqual(t, wantNull, gotPayload)
-				require.Nil(t, gotChasmReq.GetSuccess())
 			} else {
 				protorequire.ProtoEqual(t, tc.result, gotPayload)
 				protorequire.ProtoEqual(t, tc.result, gotChasmReq.GetSuccess())
+			}
+		})
+	}
+}
+
+func TestProcessInvocationTask_ResultSubscription_NonTerminalCloseIsPermanent(t *testing.T) {
+	t.Parallel()
+
+	subMeta := &commonpb.Callback_ResultSubscription{
+		RequestId:           "sub-req-1",
+		ResultFormatVersion: commoncallbacks.ResultSubscriptionFormatVersionV1,
+		ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "workflow-id", RunId: "origin-run"},
+	}
+
+	for _, tc := range []struct {
+		name              string
+		subErr            error
+		wantUnprocessable bool
+	}{
+		{
+			name:              "successor close event becomes permanent unprocessable error",
+			subErr:            commoncallbacks.ErrResultSubscriptionNonTerminalClose,
+			wantUnprocessable: true,
+		},
+		{
+			name:              "transient read error stays retryable",
+			subErr:            serviceerror.NewUnavailable("persistence unavailable"),
+			wantUnprocessable: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cb := callbacks.Callback{
+				CallbackInfo: &persistencespb.CallbackInfo{
+					Callback: &persistencespb.Callback{
+						Variant: &persistencespb.Callback_Nexus_{
+							Nexus: &persistencespb.Callback_Nexus{Url: commonnexus.SystemCallbackURL},
+						},
+						ResultSubscription: subMeta,
+					},
+					State:     enumsspb.CALLBACK_STATE_SCHEDULED,
+					RequestId: "attach-req-1",
+				},
+			}
+			_, err := executeHSMCallbackTask(t, &dualMutableState{subErr: tc.subErr}, "sub", cb, commonnexus.SystemCallbackURL, nil, nil, log.NewTestLogger())
+			require.ErrorIs(t, err, tc.subErr)
+			var unprocessableErr *queueserrors.UnprocessableTaskError
+			if tc.wantUnprocessable {
+				require.ErrorAs(t, err, &unprocessableErr)
+			} else {
+				require.NotErrorAs(t, err, &unprocessableErr)
 			}
 		})
 	}
