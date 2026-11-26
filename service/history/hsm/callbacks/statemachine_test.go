@@ -110,36 +110,34 @@ func TestValidTransitions(t *testing.T) {
 func TestTransitionCanceled(t *testing.T) {
 	t.Parallel()
 
-	for _, state := range []enumsspb.CallbackState{
-		enumsspb.CALLBACK_STATE_STANDBY,
-		enumsspb.CALLBACK_STATE_SCHEDULED,
-		enumsspb.CALLBACK_STATE_BACKING_OFF,
-	} {
-		t.Run("from_"+state.String(), func(t *testing.T) {
-			t.Parallel()
-			cb := callbacks.Callback{
-				CallbackInfo: &persistencespb.CallbackInfo{
-					State: state,
-					Callback: &persistencespb.Callback{
-						Variant: &persistencespb.Callback_Nexus_{
-							Nexus: &persistencespb.Callback_Nexus{Url: "temporal://system"},
-						},
+	t.Run("from_STANDBY", func(t *testing.T) {
+		t.Parallel()
+		cb := callbacks.Callback{
+			CallbackInfo: &persistencespb.CallbackInfo{
+				State: enumsspb.CALLBACK_STATE_STANDBY,
+				Callback: &persistencespb.Callback{
+					Variant: &persistencespb.Callback_Nexus_{
+						Nexus: &persistencespb.Callback_Nexus{Url: "temporal://system"},
 					},
 				},
-			}
-			require.True(t, callbacks.TransitionCanceled.Possible(cb))
-			out, err := callbacks.TransitionCanceled.Apply(cb, callbacks.EventCanceled{})
-			require.NoError(t, err)
-			require.Equal(t, enumsspb.CALLBACK_STATE_CANCELED, cb.State())
-			require.Nil(t, cb.NextAttemptScheduleTime)
-			require.Empty(t, out.Tasks)
-		})
-	}
+			},
+		}
+		require.True(t, callbacks.TransitionCanceled.Possible(cb))
+		out, err := callbacks.TransitionCanceled.Apply(cb, callbacks.EventCanceled{})
+		require.NoError(t, err)
+		require.Equal(t, enumsspb.CALLBACK_STATE_FAILED, cb.State())
+		require.NotNil(t, cb.GetLastAttemptFailure().GetCanceledFailureInfo())
+		require.Equal(t, "result subscription canceled", cb.GetLastAttemptFailure().GetMessage())
+		require.Zero(t, cb.GetAttempt())
+		require.Nil(t, cb.NextAttemptScheduleTime)
+		require.Empty(t, out.Tasks)
+	})
 
 	for _, state := range []enumsspb.CallbackState{
+		enumsspb.CALLBACK_STATE_SCHEDULED,
+		enumsspb.CALLBACK_STATE_BACKING_OFF,
 		enumsspb.CALLBACK_STATE_SUCCEEDED,
 		enumsspb.CALLBACK_STATE_FAILED,
-		enumsspb.CALLBACK_STATE_CANCELED,
 	} {
 		t.Run("rejected_from_"+state.String(), func(t *testing.T) {
 			t.Parallel()
@@ -204,24 +202,6 @@ func TestCompareState(t *testing.T) {
 			s2:        enumsspb.CALLBACK_STATE_SCHEDULED,
 			attempts2: 1,
 			sign:      -1,
-		},
-		{
-			name: "standby < canceled",
-			s1:   enumsspb.CALLBACK_STATE_STANDBY,
-			s2:   enumsspb.CALLBACK_STATE_CANCELED,
-			sign: -1,
-		},
-		{
-			name: "canceled = canceled",
-			s1:   enumsspb.CALLBACK_STATE_CANCELED,
-			s2:   enumsspb.CALLBACK_STATE_CANCELED,
-			sign: 0,
-		},
-		{
-			name:        "canceled not comparable to succeeded",
-			s1:          enumsspb.CALLBACK_STATE_CANCELED,
-			s2:          enumsspb.CALLBACK_STATE_SUCCEEDED,
-			expectError: true,
 		},
 	}
 

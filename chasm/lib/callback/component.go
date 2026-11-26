@@ -65,7 +65,7 @@ func (c *Callback) LifecycleState(_ chasm.Context) chasm.LifecycleState {
 	switch c.Status {
 	case callbackspb.CALLBACK_STATUS_SUCCEEDED:
 		return chasm.LifecycleStateCompleted
-	case callbackspb.CALLBACK_STATUS_FAILED, callbackspb.CALLBACK_STATUS_CANCELED:
+	case callbackspb.CALLBACK_STATUS_FAILED:
 		return chasm.LifecycleStateFailed
 	default:
 		return chasm.LifecycleStateRunning
@@ -287,7 +287,7 @@ func (c *Callback) apiStatus() (enumspb.CallbackState, error) {
 		return enumspb.CALLBACK_STATE_SCHEDULED, nil
 	case callbackspb.CALLBACK_STATUS_BACKING_OFF:
 		return enumspb.CALLBACK_STATE_BACKING_OFF, nil
-	case callbackspb.CALLBACK_STATUS_FAILED, callbackspb.CALLBACK_STATUS_CANCELED:
+	case callbackspb.CALLBACK_STATUS_FAILED:
 		return enumspb.CALLBACK_STATE_FAILED, nil
 	case callbackspb.CALLBACK_STATUS_SUCCEEDED:
 		return enumspb.CALLBACK_STATE_SUCCEEDED, nil

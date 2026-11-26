@@ -1531,17 +1531,9 @@ func (s *workflowResetterSuite) TestReapplyEvents() {
 				switch event.GetEventType() { // nolint:exhaustive
 				case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED:
 					attr := event.GetWorkflowExecutionOptionsUpdatedEventAttributes()
-					ms.EXPECT().AddWorkflowExecutionOptionsUpdatedEvent(
-						attr.GetVersioningOverride(),
-						attr.GetUnsetVersioningOverride(),
-						attr.GetAttachedRequestId(),
-						attr.GetAttachedCompletionCallbacks(),
+					ms.EXPECT().AddWorkflowExecutionOptionsUpdatedEventWithAttributes(
+						attr,
 						event.Links,
-						attr.GetIdentity(),
-						attr.GetPriority(),
-						attr.GetTimeSkippingConfig(),
-						attr.GetTimeSkippingConfigUpdated(),
-						attr.GetWorkflowUpdateOptions(),
 					).Return(&historypb.HistoryEvent{}, nil)
 				case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED:
 					attr := event.GetWorkflowExecutionSignaledEventAttributes()
@@ -2062,17 +2054,9 @@ func (s *workflowResetterSuite) TestReapplyEvents_WorkflowOptionsUpdated_WithTim
 	root, err := hsm.NewRoot(smReg, workflow.StateMachineType, nil, make(map[string]*persistencespb.StateMachineMap), nil)
 	s.NoError(err)
 	ms.EXPECT().HSM().Return(root).AnyTimes()
-	ms.EXPECT().AddWorkflowExecutionOptionsUpdatedEvent(
-		attr.GetVersioningOverride(),
-		attr.GetUnsetVersioningOverride(),
-		attr.GetAttachedRequestId(),
-		attr.GetAttachedCompletionCallbacks(),
+	ms.EXPECT().AddWorkflowExecutionOptionsUpdatedEventWithAttributes(
+		attr,
 		event.Links,
-		attr.GetIdentity(),
-		attr.GetPriority(),
-		timeSkippingConfig,
-		attr.GetTimeSkippingConfigUpdated(),
-		attr.GetWorkflowUpdateOptions(),
 	).Return(&historypb.HistoryEvent{}, nil)
 
 	appliedEvents, err := reapplyEvents(context.Background(), ms, nil, smReg, chasmworkflow.NewRegistry(), []*historypb.HistoryEvent{event}, nil, "", true, s.logger)

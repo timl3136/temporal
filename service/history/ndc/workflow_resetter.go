@@ -1122,25 +1122,15 @@ func reapplyEvents(
 			requestID := attr.GetAttachedRequestId()
 			if len(callbacks) > 0 && requestID != "" {
 				if mutableState.HasRequestID(requestID) {
-					if attr.GetVersioningOverride() == nil && !attr.GetUnsetVersioningOverride() {
+					if attr.GetVersioningOverride() == nil && !attr.GetUnsetVersioningOverride() &&
+						len(attr.GetCanceledResultSubscriptionRequestIds()) == 0 {
 						// if completion callbacks exist, and no other updates in the event, we should skip the event
 						continue
 					}
 					return reappliedEvents, serviceerror.NewInternalf("unable to reapply WorkflowExecutionOptionsUpdated event: %d completion callbacks are already attached but the event contains additional workflow option updates", len(callbacks))
 				}
 			}
-			if _, err := mutableState.AddWorkflowExecutionOptionsUpdatedEvent(
-				attr.GetVersioningOverride(),
-				attr.GetUnsetVersioningOverride(),
-				requestID,
-				callbacks,
-				event.Links,
-				attr.GetIdentity(),
-				attr.GetPriority(),
-				attr.GetTimeSkippingConfig(),
-				attr.GetTimeSkippingConfigUpdated(),
-				attr.GetWorkflowUpdateOptions(),
-			); err != nil {
+			if _, err := mutableState.AddWorkflowExecutionOptionsUpdatedEventWithAttributes(attr, event.Links); err != nil {
 				return reappliedEvents, err
 			}
 			reappliedEvents = append(reappliedEvents, event)

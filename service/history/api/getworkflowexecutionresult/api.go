@@ -6,9 +6,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/google/uuid"
+	"github.com/nexus-rpc/sdk-go/nexus"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
@@ -28,8 +28,6 @@ import (
 	"go.temporal.io/server/service/history/api"
 	"go.temporal.io/server/service/history/configs"
 	"go.temporal.io/server/service/history/consts"
-	"go.temporal.io/server/service/history/hsm"
-	//nolint:staticcheck // SA1019: HSM callbacks remain supported alongside CHASM.
 	hsmcallbacks "go.temporal.io/server/service/history/hsm/callbacks"
 	historyi "go.temporal.io/server/service/history/interfaces"
 	"google.golang.org/protobuf/proto"
@@ -49,7 +47,7 @@ type StartRequest struct {
 	Callback    *commonpb.Callback              // validated by the Nexus handler
 }
 
-// Exactly one field is set.
+// StartResult holds the outcome of Start; exactly one field is set.
 type StartResult struct {
 	Closed     *historypb.HistoryEvent // cloned terminal close event; F1 converts it with B
 	Subscribed *Subscription
@@ -98,95 +96,13 @@ func Start(
 			result = StartResult{}
 			rejectErr = nil
 
-			ms := lease.GetMutableState()
-
-			// Deduplicate before checking feature flag, closed status, or capacity so retries of
-			// accepted waits (including inherited callbacks and lost responses after close) return
-			// their original resolved-run token without writing.
-			existing, found, err := findResultSubscription(ctx, ms, req.RequestID)
+			res, action, rErr, err := startOnLease(ctx, shard, nsName, req, lease, target)
 			if err != nil {
 				return nil, err
 			}
-			if found {
-				if err := verifyStoredCallbackCaller(existing.url, existing.header, req.Caller); err != nil {
-					rejectErr = err
-					return &api.UpdateWorkflowAction{Noop: true}, nil
-				}
-				resolvedRunID := cmp.Or(existing.sub.GetResolvedExecution().GetRunId(), target.workflowKey.RunID)
-				sub, err := buildSubscription(nsName, req.NamespaceID.String(), target.workflowKey.WorkflowID, target.firstRunID, resolvedRunID, req.RequestID)
-				if err != nil {
-					rejectErr = err
-					return &api.UpdateWorkflowAction{Noop: true}, nil
-				}
-				result = StartResult{Subscribed: sub}
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
-
-			if !shard.GetConfig().EnableGetWorkflowExecutionResultFromWorkflow(nsName) {
-				rejectErr = serviceerror.NewFailedPrecondition("GetWorkflowExecutionResult operation is disabled")
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
-
-			if target.closeEvent != nil {
-				result = StartResult{Closed: target.closeEvent}
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
-
-			cb := common.CloneProto(req.Callback)
-			cb.ResultSubscription = &commonpb.Callback_ResultSubscription{
-				RequestId:           req.RequestID,
-				ResultFormatVersion: resultFormatVersionV1,
-				ResolvedExecution: &commonpb.WorkflowExecution{
-					WorkflowId: target.workflowKey.WorkflowID,
-					RunId:      target.workflowKey.RunID,
-				},
-			}
-
-			collision, err := hasConflictingNonResultCallback(ctx, ms, req.RequestID)
-			if err != nil {
-				return nil, err
-			}
-			if collision {
-				rejectErr = serviceerror.NewInvalidArgument("request ID is already attached to a different callback")
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
-
-			if err := checkTargetHistoryBudget(shard.GetConfig(), nsName, ms, req.RequestID, cb); err != nil {
-				rejectErr = err
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
-
-			if err := validateCallbackCapacity(ctx, shard.GetConfig(), nsName, lease, req.RequestID, cb); err != nil {
-				if _, isResExhausted := errors.AsType[*serviceerror.ResourceExhausted](err); isResExhausted {
-					rejectErr = err
-					return &api.UpdateWorkflowAction{Noop: true}, nil
-				}
-				return nil, err
-			}
-
-			sub, err := buildSubscription(nsName, req.NamespaceID.String(), target.workflowKey.WorkflowID, target.firstRunID, target.workflowKey.RunID, req.RequestID)
-			if err != nil {
-				rejectErr = err
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
-
-			if _, err := ms.AddWorkflowExecutionOptionsUpdatedEvent(
-				nil,   // versioningOverride
-				false, // unsetVersioningOverride
-				req.RequestID,
-				[]*commonpb.Callback{cb},
-				nil,   // links
-				"",    // identity
-				nil,   // priority
-				nil,   // timeSkippingConfig
-				false, // timeSkippingConfigUpdated
-				nil,   // workflowUpdateOptions
-			); err != nil {
-				return nil, err
-			}
-
-			result = StartResult{Subscribed: sub}
-			return api.UpdateWorkflowWithoutWorkflowTask, nil
+			result = res
+			rejectErr = rErr
+			return action, nil
 		},
 	)
 	if err != nil {
@@ -196,6 +112,108 @@ func Start(
 		return StartResult{}, rejectErr
 	}
 	return result, nil
+}
+
+func startOnLease(
+	ctx context.Context,
+	shard historyi.ShardContext,
+	nsName string,
+	req StartRequest,
+	lease api.WorkflowLease,
+	target resolvedTarget,
+) (result StartResult, action *api.UpdateWorkflowAction, rejectErr error, err error) {
+	ms := lease.GetMutableState()
+
+	// Deduplicate before checking feature flag, closed status, or capacity so retries of
+	// accepted waits (including inherited callbacks and lost responses after close) return
+	// their original resolved-run token without writing.
+	existing, found, err := findResultSubscription(ctx, ms, req.RequestID)
+	if err != nil {
+		return StartResult{}, nil, nil, err
+	}
+	if found {
+		if err := verifyStoredCallbackCaller(existing.url, existing.header, req.Caller); err != nil {
+			return StartResult{}, &api.UpdateWorkflowAction{Noop: true}, err, nil
+		}
+		resolvedRunID := cmp.Or(existing.sub.GetResolvedExecution().GetRunId(), target.workflowKey.RunID)
+		sub, err := buildSubscription(nsName, req.NamespaceID.String(), target.workflowKey.WorkflowID, target.firstRunID, resolvedRunID, req.RequestID)
+		if err != nil {
+			return StartResult{}, &api.UpdateWorkflowAction{Noop: true}, err, nil
+		}
+		return StartResult{Subscribed: sub}, &api.UpdateWorkflowAction{Noop: true}, nil, nil
+	}
+
+	if !shard.GetConfig().EnableGetWorkflowExecutionResultFromWorkflow(nsName) {
+		return StartResult{}, &api.UpdateWorkflowAction{Noop: true}, serviceerror.NewFailedPrecondition("GetWorkflowExecutionResult operation is disabled"), nil
+	}
+
+	if target.closeEvent != nil {
+		return StartResult{Closed: target.closeEvent}, &api.UpdateWorkflowAction{Noop: true}, nil, nil
+	}
+
+	return attachResultSubscriptionOnLease(ctx, shard, nsName, req, lease, target)
+}
+
+func attachResultSubscriptionOnLease(
+	ctx context.Context,
+	shard historyi.ShardContext,
+	nsName string,
+	req StartRequest,
+	lease api.WorkflowLease,
+	target resolvedTarget,
+) (result StartResult, action *api.UpdateWorkflowAction, rejectErr error, err error) {
+	ms := lease.GetMutableState()
+	cb := common.CloneProto(req.Callback)
+	cb.ResultSubscription = &commonpb.Callback_ResultSubscription{
+		RequestId:           req.RequestID,
+		ResultFormatVersion: resultFormatVersionV1,
+		ResolvedExecution: &commonpb.WorkflowExecution{
+			WorkflowId: target.workflowKey.WorkflowID,
+			RunId:      target.workflowKey.RunID,
+		},
+	}
+
+	collision, err := hasConflictingNonResultCallback(ctx, ms, req.RequestID)
+	if err != nil {
+		return StartResult{}, nil, nil, err
+	}
+	if collision {
+		return StartResult{}, &api.UpdateWorkflowAction{Noop: true}, serviceerror.NewInvalidArgument("request ID is already attached to a different callback"), nil
+	}
+
+	if err := checkTargetHistoryBudget(shard.GetConfig(), nsName, ms, req.RequestID, cb); err != nil {
+		return StartResult{}, &api.UpdateWorkflowAction{Noop: true}, err, nil
+	}
+
+	if err := validateCallbackCapacity(ctx, shard.GetConfig(), nsName, lease, req.RequestID, cb); err != nil {
+		if _, isResExhausted := errors.AsType[*serviceerror.ResourceExhausted](err); isResExhausted {
+			return StartResult{}, &api.UpdateWorkflowAction{Noop: true}, err, nil
+		}
+		return StartResult{}, nil, nil, err
+	}
+
+	sub, err := buildSubscription(nsName, req.NamespaceID.String(), target.workflowKey.WorkflowID, target.firstRunID, target.workflowKey.RunID, req.RequestID)
+	if err != nil {
+		return StartResult{}, &api.UpdateWorkflowAction{Noop: true}, err, nil
+	}
+
+	_, err = ms.AddWorkflowExecutionOptionsUpdatedEvent(
+		nil,   // versioningOverride
+		false, // unsetVersioningOverride
+		req.RequestID,
+		[]*commonpb.Callback{cb},
+		nil,   // links
+		"",    // identity
+		nil,   // priority
+		nil,   // timeSkippingConfig
+		false, // timeSkippingConfigUpdated
+		nil,   // workflowUpdateOptions
+	)
+	if err != nil {
+		return StartResult{}, nil, nil, err
+	}
+
+	return StartResult{Subscribed: sub}, api.UpdateWorkflowWithoutWorkflowTask, nil, nil
 }
 
 // Cancel explicitly cancels one result subscription identified by token on the target chain.
@@ -232,11 +250,12 @@ func Cancel(
 }
 
 func validateStartRequest(req StartRequest) error {
-	if err := validateResolveRequest(resolveRequest{
+	err := validateResolveRequest(resolveRequest{
 		namespaceID: req.NamespaceID,
 		caller:      req.Caller,
 		target:      req.Target,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	if req.RequestID == "" {
@@ -447,7 +466,7 @@ func cancelSubscriptionOnLease(
 	tok *tokenspb.ResultSubscriptionToken,
 	caller *historyservice.NexusCallerInfo,
 	running bool,
-) (*api.UpdateWorkflowAction, error, error) {
+) (action *api.UpdateWorkflowAction, err error, cleanErr error) {
 	ms := lease.GetMutableState()
 	stored, found, err := findResultSubscription(ctx, ms, tok.GetRequestId())
 	if err != nil {
@@ -464,40 +483,18 @@ func cancelSubscriptionOnLease(
 	if err := verifyStoredCallbackCaller(stored.url, stored.header, caller); err != nil {
 		return &api.UpdateWorkflowAction{Noop: true}, nil, err
 	}
-	if !stored.cancelable {
+	if !running || !stored.cancelable {
 		return &api.UpdateWorkflowAction{Noop: true}, nil, nil
 	}
 
-	if running {
-		if _, err := ms.AddWorkflowExecutionOptionsUpdatedEventWithAttributes(
-			&historypb.WorkflowExecutionOptionsUpdatedEventAttributes{
-				CanceledResultSubscriptionRequestIds: []string{tok.GetRequestId()},
-			},
-			nil,
-		); err != nil {
-			return nil, err, nil
-		}
-		return api.UpdateWorkflowWithoutWorkflowTask, nil, nil
-	}
-
-	// Closed workflows cannot append history events; transition the callback state machine directly
-	// to invalidate queued or backing-off delivery tasks.
-	if stored.isChasm {
-		wf, chasmCtx, err := ms.ChasmWorkflowComponent(ctx)
-		if err != nil {
-			return nil, err, nil
-		}
-		if err := wf.CancelResultSubscriptions(chasmCtx, []string{stored.key}); err != nil {
-			return nil, err, nil
-		}
-	} else {
-		coll := hsmcallbacks.MachineCollection(ms.HSM())
-		//nolint:staticcheck // SA1019: HSM callbacks remain supported alongside CHASM.
-		if err := coll.Transition(stored.key, func(cb hsmcallbacks.Callback) (hsm.TransitionOutput, error) {
-			return hsmcallbacks.TransitionCanceled.Apply(cb, hsmcallbacks.EventCanceled{})
-		}); err != nil {
-			return nil, err, nil
-		}
+	_, err = ms.AddWorkflowExecutionOptionsUpdatedEventWithAttributes(
+		&historypb.WorkflowExecutionOptionsUpdatedEventAttributes{
+			CanceledResultSubscriptionRequestIds: []string{tok.GetRequestId()},
+		},
+		nil,
+	)
+	if err != nil {
+		return nil, err, nil
 	}
 	return api.UpdateWorkflowWithoutWorkflowTask, nil, nil
 }
@@ -525,7 +522,6 @@ func readChainSuccessor(
 
 type storedSubscription struct {
 	isChasm    bool
-	key        string
 	sub        *commonpb.Callback_ResultSubscription
 	url        string
 	header     map[string]string
@@ -545,10 +541,9 @@ func findResultSubscription(
 		if err != nil {
 			return storedSubscription{}, false, err
 		}
-		if key, cb, ok := wf.FindResultSubscription(readCtx, requestID); ok {
+		if _, cb, ok := wf.FindResultSubscription(readCtx, requestID); ok {
 			return storedSubscription{
 				isChasm:    true,
-				key:        key,
 				sub:        cb.GetCallback().GetResultSubscription(),
 				url:        cb.GetCallback().GetNexus().GetUrl(),
 				header:     cb.GetCallback().GetNexus().GetHeader(),
@@ -567,7 +562,6 @@ func findResultSubscription(
 			if sub != nil && sub.GetRequestId() == requestID {
 				return storedSubscription{
 					isChasm:    false,
-					key:        node.Key.ID,
 					sub:        sub,
 					url:        cb.GetCallback().GetNexus().GetUrl(),
 					header:     cb.GetCallback().GetNexus().GetHeader(),
@@ -806,7 +800,7 @@ func extractCallbackCaller(
 	url string,
 	header map[string]string,
 ) (namespaceID, workflowID, runID, requestID string, err error) {
-	encodedToken := getHeaderCaseInsensitive(header, commonnexus.CallbackTokenHeader)
+	encodedToken := nexus.Header(header).Get(commonnexus.CallbackTokenHeader)
 	if encodedToken == "" {
 		return "", "", "", "", serviceerror.NewInvalidArgument("callback missing token header")
 	}
@@ -841,19 +835,4 @@ func extractCallbackCaller(
 		return "", "", "", "", serviceerror.NewInvalidArgument("callback token missing caller identity")
 	}
 	return nsID, wfID, rID, completion.GetRequestId(), nil
-}
-
-func getHeaderCaseInsensitive(headers map[string]string, key string) string {
-	if v, ok := headers[strings.ToLower(key)]; ok {
-		return v
-	}
-	if v, ok := headers[key]; ok {
-		return v
-	}
-	for k, v := range headers {
-		if strings.EqualFold(k, key) {
-			return v
-		}
-	}
-	return ""
 }

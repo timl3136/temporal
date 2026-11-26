@@ -149,14 +149,16 @@ var TransitionSucceeded = chasm.NewTransition(
 type EventCanceled struct{}
 
 var TransitionCanceled = chasm.NewTransition(
-	[]callbackspb.CallbackStatus{
-		callbackspb.CALLBACK_STATUS_STANDBY,
-		callbackspb.CALLBACK_STATUS_SCHEDULED,
-		callbackspb.CALLBACK_STATUS_BACKING_OFF,
-	},
-	callbackspb.CALLBACK_STATUS_CANCELED,
+	[]callbackspb.CallbackStatus{callbackspb.CALLBACK_STATUS_STANDBY},
+	callbackspb.CALLBACK_STATUS_FAILED,
 	func(cb *Callback, _ chasm.MutableContext, _ EventCanceled) error {
 		cb.NextAttemptScheduleTime = nil
+		cb.LastAttemptFailure = &failurepb.Failure{
+			Message: "result subscription canceled",
+			FailureInfo: &failurepb.Failure_CanceledFailureInfo{
+				CanceledFailureInfo: &failurepb.CanceledFailureInfo{},
+			},
+		}
 		return nil
 	},
 )

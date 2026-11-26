@@ -42,8 +42,6 @@ const (
 	CALLBACK_STATUS_FAILED CallbackStatus = 4
 	// Callback has succeeded.
 	CALLBACK_STATUS_SUCCEEDED CallbackStatus = 5
-	// Callback has been canceled and will not be delivered.
-	CALLBACK_STATUS_CANCELED CallbackStatus = 6
 )
 
 // Enum value maps for CallbackStatus.
@@ -55,7 +53,6 @@ var (
 		3: "CALLBACK_STATUS_BACKING_OFF",
 		4: "CALLBACK_STATUS_FAILED",
 		5: "CALLBACK_STATUS_SUCCEEDED",
-		6: "CALLBACK_STATUS_CANCELED",
 	}
 	CallbackStatus_value = map[string]int32{
 		"CALLBACK_STATUS_UNSPECIFIED": 0,
@@ -64,7 +61,6 @@ var (
 		"CALLBACK_STATUS_BACKING_OFF": 3,
 		"CALLBACK_STATUS_FAILED":      4,
 		"CALLBACK_STATUS_SUCCEEDED":   5,
-		"CALLBACK_STATUS_CANCELED":    6,
 	}
 )
 
@@ -88,8 +84,6 @@ func (x CallbackStatus) String() string {
 		return "Failed"
 	case CALLBACK_STATUS_SUCCEEDED:
 		return "Succeeded"
-	case CALLBACK_STATUS_CANCELED:
-		return "Canceled"
 	default:
 		return strconv.Itoa(int(x))
 	}
@@ -588,15 +582,14 @@ const file_temporal_server_chasm_lib_callback_proto_v1_message_proto_rawDesc = "
 	"\avariantJ\x04\b\x01\x10\x02\"x\n" +
 	"\x10CallbackMetadata\x122\n" +
 	"\x15total_callbacks_count\x18\x01 \x01(\x03R\x13totalCallbacksCount\x120\n" +
-	"\x14total_callbacks_size\x18\x02 \x01(\x03R\x12totalCallbacksSize*\xe7\x01\n" +
+	"\x14total_callbacks_size\x18\x02 \x01(\x03R\x12totalCallbacksSize*\xc9\x01\n" +
 	"\x0eCallbackStatus\x12\x1f\n" +
 	"\x1bCALLBACK_STATUS_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17CALLBACK_STATUS_STANDBY\x10\x01\x12\x1d\n" +
 	"\x19CALLBACK_STATUS_SCHEDULED\x10\x02\x12\x1f\n" +
 	"\x1bCALLBACK_STATUS_BACKING_OFF\x10\x03\x12\x1a\n" +
 	"\x16CALLBACK_STATUS_FAILED\x10\x04\x12\x1d\n" +
-	"\x19CALLBACK_STATUS_SUCCEEDED\x10\x05\x12\x1c\n" +
-	"\x18CALLBACK_STATUS_CANCELED\x10\x06BHZFgo.temporal.io/server/chasm/lib/callback/gen/callbackpb/v1;callbackspbb\x06proto3"
+	"\x19CALLBACK_STATUS_SUCCEEDED\x10\x05BHZFgo.temporal.io/server/chasm/lib/callback/gen/callbackpb/v1;callbackspbb\x06proto3"
 
 var (
 	file_temporal_server_chasm_lib_callback_proto_v1_message_proto_rawDescOnce sync.Once

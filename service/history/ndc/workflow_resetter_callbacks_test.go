@@ -15,6 +15,7 @@ import (
 	"go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
+	callbackspb "go.temporal.io/server/chasm/lib/callback/gen/callbackpb/v1"
 	chasmworkflow "go.temporal.io/server/chasm/lib/workflow"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/dynamicconfig"
@@ -175,4 +176,106 @@ func TestReapplyEvents_KeepsCallbacksOverLimit(t *testing.T) {
 			require.Equal(t, int64(6), wf.GetCallbackMetadata().GetTotalCallbacksCount())
 		})
 	}
+}
+
+func TestReapplyEvents_ResultSubscriptionCancelSurvivesReset(t *testing.T) {
+	t.Parallel()
+
+	subCB := &commonpb.Callback{
+		Variant: &commonpb.Callback_Nexus_{
+			Nexus: &commonpb.Callback_Nexus{Url: "temporal://system"},
+		},
+		ResultSubscription: &commonpb.Callback_ResultSubscription{
+			RequestId:           "sub-req-1",
+			ResultFormatVersion: 1,
+			ResolvedExecution: &commonpb.WorkflowExecution{
+				WorkflowId: tests.WorkflowID,
+				RunId:      tests.RunID,
+			},
+		},
+	}
+	attachEvent := &historypb.HistoryEvent{
+		EventId:   10,
+		Version:   1,
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionOptionsUpdatedEventAttributes{
+			WorkflowExecutionOptionsUpdatedEventAttributes: &historypb.WorkflowExecutionOptionsUpdatedEventAttributes{
+				AttachedRequestId:           "sub-req-1",
+				AttachedCompletionCallbacks: []*commonpb.Callback{subCB},
+			},
+		},
+	}
+	cancelEvent := &historypb.HistoryEvent{
+		EventId:   11,
+		Version:   1,
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionOptionsUpdatedEventAttributes{
+			WorkflowExecutionOptionsUpdatedEventAttributes: &historypb.WorkflowExecutionOptionsUpdatedEventAttributes{
+				CanceledResultSubscriptionRequestIds: []string{"sub-req-1"},
+			},
+		},
+	}
+
+	t.Run("reset to before attach reapplies attach and cancel leaving callback canceled", func(t *testing.T) {
+		t.Parallel()
+
+		ms := newChasmCallbacksMutableState(t)
+		applied, err := reapplyEvents(
+			t.Context(),
+			ms,
+			nil,
+			hsm.NewRegistry(),
+			chasmworkflow.NewRegistry(),
+			[]*historypb.HistoryEvent{attachEvent, cancelEvent},
+			nil,
+			"",
+			true,
+			log.NewTestLogger(),
+		)
+		require.NoError(t, err)
+		require.Len(t, applied, 2)
+
+		wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(t.Context())
+		require.NoError(t, err)
+		_, cb, ok := wf.FindResultSubscription(ctx, "sub-req-1")
+		require.True(t, ok)
+		require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, cb.Status)
+		require.NotNil(t, cb.GetLastAttemptFailure().GetCanceledFailureInfo())
+	})
+
+	t.Run("reset after attach reapplies cancel-only event without dropping it", func(t *testing.T) {
+		t.Parallel()
+
+		ms := newChasmCallbacksMutableState(t)
+		// Base branch before reset point already has the attachment applied.
+		_, err := ms.AddWorkflowExecutionOptionsUpdatedEventWithAttributes(
+			attachEvent.GetWorkflowExecutionOptionsUpdatedEventAttributes(),
+			nil,
+		)
+		require.NoError(t, err)
+
+		// Reapplying both events skips the duplicate attach and applies the cancel-only event.
+		applied, err := reapplyEvents(
+			t.Context(),
+			ms,
+			nil,
+			hsm.NewRegistry(),
+			chasmworkflow.NewRegistry(),
+			[]*historypb.HistoryEvent{attachEvent, cancelEvent},
+			nil,
+			"",
+			true,
+			log.NewTestLogger(),
+		)
+		require.NoError(t, err)
+		require.Len(t, applied, 1)
+		require.Equal(t, cancelEvent.GetEventId(), applied[0].GetEventId())
+
+		wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(t.Context())
+		require.NoError(t, err)
+		_, cb, ok := wf.FindResultSubscription(ctx, "sub-req-1")
+		require.True(t, ok)
+		require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, cb.Status)
+		require.NotNil(t, cb.GetLastAttemptFailure().GetCanceledFailureInfo())
+	})
 }

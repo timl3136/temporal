@@ -321,11 +321,6 @@ func TestAPIStateCircuitBreaker(t *testing.T) {
 			status:    callbackspb.CALLBACK_STATUS_FAILED,
 			wantState: enumspb.CALLBACK_STATE_FAILED,
 		},
-		{
-			name:      "canceled",
-			status:    callbackspb.CALLBACK_STATUS_CANCELED,
-			wantState: enumspb.CALLBACK_STATE_FAILED,
-		},
 	}
 
 	for _, tc := range cases {

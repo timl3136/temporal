@@ -416,7 +416,8 @@ func (s *mutableStateSuite) TestResultSubscriptionCallbacks_CancelAndReplay() {
 		s.Equal(int64(2), wf.GetCallbackMetadata().GetTotalCallbacksCount())
 		_, cb1, ok := wf.FindResultSubscription(ctx, "sub-1")
 		s.Require().True(ok)
-		s.Equal(callbackspb.CALLBACK_STATUS_CANCELED, cb1.Status)
+		s.Equal(callbackspb.CALLBACK_STATUS_FAILED, cb1.Status)
+		s.NotNil(cb1.GetLastAttemptFailure().GetCanceledFailureInfo())
 		_, cb2, ok := wf.FindResultSubscription(ctx, "sub-2")
 		s.Require().True(ok)
 		s.Equal(callbackspb.CALLBACK_STATUS_STANDBY, cb2.Status)
@@ -432,13 +433,14 @@ func (s *mutableStateSuite) TestResultSubscriptionCallbacks_CancelAndReplay() {
 		s.Require().NoError(err)
 		_, rcb1, ok := replayWF.FindResultSubscription(replayCtx, "sub-1")
 		s.Require().True(ok)
-		s.Equal(callbackspb.CALLBACK_STATUS_CANCELED, rcb1.Status)
+		s.Equal(callbackspb.CALLBACK_STATUS_FAILED, rcb1.Status)
+		s.NotNil(rcb1.GetLastAttemptFailure().GetCanceledFailureInfo())
 		_, rcb2, ok := replayWF.FindResultSubscription(replayCtx, "sub-2")
 		s.Require().True(ok)
 		s.Equal(callbackspb.CALLBACK_STATUS_STANDBY, rcb2.Status)
 	})
 
-	s.Run("HSM cancel preserves other waiter and does not fail workflow close", func() {
+	s.Run("HSM cancel preserves other waiter, skips canceled on CAN, and does not fail workflow close", func() {
 		ms := s.enableChasmCallbacks(10)
 		s.mockConfig.EnableCHASMCallbacks = dynamicconfig.GetBoolPropertyFnFilteredByNamespace(false)
 		_, completedEvent := s.startWithCompletionCallbacks(ms, 0)
@@ -463,18 +465,26 @@ func (s *mutableStateSuite) TestResultSubscriptionCallbacks_CancelAndReplay() {
 		coll := callbacks.MachineCollection(ms.HSM())
 		cb1, err := coll.Data("cb-sub-1-0")
 		s.Require().NoError(err)
-		s.Equal(enumsspb.CALLBACK_STATE_CANCELED, cb1.State())
+		s.Equal(enumsspb.CALLBACK_STATE_FAILED, cb1.State())
+		s.NotNil(cb1.GetLastAttemptFailure().GetCanceledFailureInfo())
 		cb2, err := coll.Data("cb-sub-2-0")
 		s.Require().NoError(err)
 		s.Equal(enumsspb.CALLBACK_STATE_STANDBY, cb2.State())
 
-		// Closing the workflow must succeed, keeping sub-1 CANCELED and scheduling sub-2.
+		// Continue-as-new carries only STANDBY callbacks (sub-2), never resurrecting canceled sub-1.
+		carried, err := getCompletionCallbacksAsProtoSlice(s.T().Context(), ms)
+		s.Require().NoError(err)
+		s.Require().Len(carried, 1)
+		s.Equal("sub-2", carried[0].GetResultSubscription().GetRequestId())
+
+		// Closing the workflow must succeed, keeping sub-1 FAILED-canceled and scheduling sub-2.
 		_, err = ms.AddCompletedWorkflowEvent(completedEvent.GetEventId(), &commandpb.CompleteWorkflowExecutionCommandAttributes{}, "")
 		s.Require().NoError(err)
 
 		cb1, err = coll.Data("cb-sub-1-0")
 		s.Require().NoError(err)
-		s.Equal(enumsspb.CALLBACK_STATE_CANCELED, cb1.State())
+		s.Equal(enumsspb.CALLBACK_STATE_FAILED, cb1.State())
+		s.NotNil(cb1.GetLastAttemptFailure().GetCanceledFailureInfo())
 		cb2, err = coll.Data("cb-sub-2-0")
 		s.Require().NoError(err)
 		s.Equal(enumsspb.CALLBACK_STATE_SCHEDULED, cb2.State())

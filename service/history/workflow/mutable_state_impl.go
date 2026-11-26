@@ -6171,9 +6171,7 @@ func (ms *MutableStateImpl) ApplyWorkflowExecutionOptionsUpdatedEvent(event *his
 	}
 
 	// Cancel result subscription callbacks.
-	if err := ms.cancelResultSubscriptionCallbacks(
-		attributes.GetCanceledResultSubscriptionRequestIds(),
-	); err != nil {
+	if err := ms.cancelResultSubscriptionCallbacks(attributes.GetCanceledResultSubscriptionRequestIds()); err != nil {
 		return err
 	}
 
@@ -7562,42 +7560,50 @@ func (ms *MutableStateImpl) cancelResultSubscriptionCallbacks(requestIDs []strin
 		return nil
 	}
 
-	if ms.ChasmEnabled() {
-		wf, readCtx, err := ms.ChasmWorkflowComponentReadOnly(context.Background())
+	if err := ms.cancelResultSubscriptionCallbacksChasm(cancelSet); err != nil {
+		return err
+	}
+	return ms.cancelResultSubscriptionCallbacksHsm(cancelSet)
+}
+
+func (ms *MutableStateImpl) cancelResultSubscriptionCallbacksChasm(cancelSet map[string]struct{}) error {
+	if !ms.ChasmEnabled() {
+		return nil
+	}
+	wf, readCtx, err := ms.ChasmWorkflowComponentReadOnly(context.Background())
+	if err != nil {
+		return err
+	}
+	keys := wf.CancelableResultSubscriptionKeys(readCtx, cancelSet)
+	if len(keys) == 0 {
+		return nil
+	}
+	wf, writeCtx, err := ms.ChasmWorkflowComponent(context.Background())
+	if err != nil {
+		return err
+	}
+	return wf.CancelResultSubscriptions(writeCtx, keys)
+}
+
+func (ms *MutableStateImpl) cancelResultSubscriptionCallbacksHsm(cancelSet map[string]struct{}) error {
+	if ms.HSM() == nil {
+		return nil
+	}
+	coll := callbacks.MachineCollection(ms.HSM())
+	for _, node := range coll.List() {
+		cb, err := coll.Data(node.Key.ID)
 		if err != nil {
 			return err
 		}
-		if keys := wf.CancelableResultSubscriptionKeys(readCtx, cancelSet); len(keys) > 0 {
-			wf, writeCtx, err := ms.ChasmWorkflowComponent(context.Background())
-			if err != nil {
-				return err
-			}
-			if err := wf.CancelResultSubscriptions(writeCtx, keys); err != nil {
-				return err
-			}
+		subReqID := cb.GetCallback().GetResultSubscription().GetRequestId()
+		if _, ok := cancelSet[subReqID]; !ok {
+			continue
 		}
-	}
-
-	if ms.HSM() != nil {
-		coll := callbacks.MachineCollection(ms.HSM())
-		for _, node := range coll.List() {
-			cb, err := coll.Data(node.Key.ID)
-			if err != nil {
-				return err
-			}
-			subReqID := cb.GetCallback().GetResultSubscription().GetRequestId()
-			if _, ok := cancelSet[subReqID]; !ok {
-				continue
-			}
-			if !callbacks.TransitionCanceled.Possible(cb) {
-				continue
-			}
-			//nolint:staticcheck // SA1019: HSM callbacks remain supported alongside CHASM.
-			if err := coll.Transition(node.Key.ID, func(cb callbacks.Callback) (hsm.TransitionOutput, error) {
-				return callbacks.TransitionCanceled.Apply(cb, callbacks.EventCanceled{})
-			}); err != nil {
-				return err
-			}
+		if !callbacks.TransitionCanceled.Possible(cb) {
+			continue
+		}
+		if err := callbacks.Cancel(coll, node.Key.ID); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -377,7 +377,8 @@ func TestResultSubscriptionLookupAndCancel(t *testing.T) {
 	require.Equal(t, []string{key1}, keys)
 	require.NoError(t, wf.CancelResultSubscriptions(ctx, keys))
 
-	require.Equal(t, callbackspb.CALLBACK_STATUS_CANCELED, wf.Callbacks[key1].Get(ctx).Status)
+	require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, wf.Callbacks[key1].Get(ctx).Status)
+	require.NotNil(t, wf.Callbacks[key1].Get(ctx).GetLastAttemptFailure().GetCanceledFailureInfo())
 	_, cb2, ok := wf.FindResultSubscription(ctx, "sub-req-2")
 	require.True(t, ok)
 	require.Equal(t, callbackspb.CALLBACK_STATUS_STANDBY, cb2.Status)

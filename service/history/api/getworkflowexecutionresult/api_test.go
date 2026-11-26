@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/stretchr/testify/require"
 	commandpb "go.temporal.io/api/command/v1"
 	commonpb "go.temporal.io/api/common/v1"
@@ -40,7 +41,6 @@ import (
 	"go.temporal.io/server/service/history/configs"
 	"go.temporal.io/server/service/history/events"
 	"go.temporal.io/server/service/history/hsm"
-	//nolint:staticcheck // SA1019: HSM callbacks remain supported alongside CHASM.
 	hsmcallbacks "go.temporal.io/server/service/history/hsm/callbacks"
 	historyi "go.temporal.io/server/service/history/interfaces"
 	"go.temporal.io/server/service/history/shard"
@@ -599,13 +599,13 @@ func makeCallerCallback(t *testing.T, caller *historyservice.NexusCallerInfo, re
 	}
 	tok, err := gen.Tokenize(completion)
 	require.NoError(t, err)
+	header := make(nexus.Header, 1)
+	header.Set(commonnexus.CallbackTokenHeader, tok)
 	return &commonpb.Callback{
 		Variant: &commonpb.Callback_Nexus_{
 			Nexus: &commonpb.Callback_Nexus{
-				Url: commonnexus.SystemCallbackURL,
-				Header: map[string]string{
-					commonnexus.CallbackTokenHeader: tok,
-				},
+				Url:    commonnexus.SystemCallbackURL,
+				Header: header,
 			},
 		},
 	}
@@ -1452,6 +1452,7 @@ func TestStartCloseRacingAttachBothLockOrders(t *testing.T) {
 
 		reqID := uuid.NewString()
 		caller := newCallerInfo(env.namespaceID, reqID)
+		cb := makeCallerCallback(t, caller, reqID, true)
 		type startOut struct {
 			res StartResult
 			err error
@@ -1463,7 +1464,7 @@ func TestStartCloseRacingAttachBothLockOrders(t *testing.T) {
 				Caller:      caller,
 				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
 				RequestID:   reqID,
-				Callback:    makeCallerCallback(t, caller, reqID, true),
+				Callback:    cb,
 			})
 			startDone <- startOut{res: res, err: err}
 		}()
@@ -1508,6 +1509,7 @@ func TestStartCloseRacingAttachBothLockOrders(t *testing.T) {
 
 		reqID := uuid.NewString()
 		caller := newCallerInfo(env.namespaceID, reqID)
+		cb := makeCallerCallback(t, caller, reqID, true)
 		type startOut struct {
 			res StartResult
 			err error
@@ -1519,7 +1521,7 @@ func TestStartCloseRacingAttachBothLockOrders(t *testing.T) {
 				Caller:      caller,
 				Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
 				RequestID:   reqID,
-				Callback:    makeCallerCallback(t, caller, reqID, true),
+				Callback:    cb,
 			})
 			startDone <- startOut{res: res, err: err}
 		}()
@@ -1553,9 +1555,9 @@ func TestStartCloseRacingAttachBothLockOrders(t *testing.T) {
 
 		wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(t.Context())
 		require.NoError(t, err)
-		_, cb, ok := wf.FindResultSubscription(ctx, reqID)
+		_, storedCB, ok := wf.FindResultSubscription(ctx, reqID)
 		require.True(t, ok)
-		require.Equal(t, callbackspb.CALLBACK_STATUS_SCHEDULED, cb.Status)
+		require.Equal(t, callbackspb.CALLBACK_STATUS_SCHEDULED, storedCB.Status)
 		env.cache.requireSingleRunLockAtATime(t)
 		env.cache.requireNoLeakedLocks(t)
 	})
@@ -1655,9 +1657,7 @@ func TestStartConcurrentDuplicateAndLastFreeSlot(t *testing.T) {
 		startGate := make(chan struct{})
 		var wg sync.WaitGroup
 		for range workers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				<-startGate
 				res, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
 					NamespaceID: env.namespaceID,
@@ -1667,7 +1667,7 @@ func TestStartConcurrentDuplicateAndLastFreeSlot(t *testing.T) {
 					Callback:    common.CloneProto(cb),
 				})
 				results <- out{res: res, err: err}
-			}()
+			})
 		}
 		close(startGate)
 		wg.Wait()
@@ -1724,12 +1724,10 @@ func TestStartConcurrentDuplicateAndLastFreeSlot(t *testing.T) {
 		startGate := make(chan struct{})
 		var wg sync.WaitGroup
 		for range contenders {
-			wg.Add(1)
 			reqID := uuid.NewString()
 			caller := newCallerInfo(env.namespaceID, reqID)
 			cb := makeCallerCallback(t, caller, reqID, true)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				<-startGate
 				res, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
 					NamespaceID: env.namespaceID,
@@ -1739,7 +1737,7 @@ func TestStartConcurrentDuplicateAndLastFreeSlot(t *testing.T) {
 					Callback:    cb,
 				})
 				results <- out{res: res, err: err}
-			}()
+			})
 		}
 		close(startGate)
 		wg.Wait()
@@ -1939,7 +1937,7 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 			t.Parallel()
 			env := newAPITestEnv(t, chasmMode)
 			runID := uuid.NewString()
-			run, ms, _ := env.addRealOpenRun(runID)
+			run, ms, wftCompleted := env.addRealOpenRun(runID)
 			env.setCurrentRun(runID)
 
 			req1, req2 := uuid.NewString(), uuid.NewString()
@@ -1988,6 +1986,29 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 			// Second Cancel is a no-op with zero writes.
 			require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller1, sub1.Subscribed.Token))
 			require.Equal(t, 3, run.updateCalls)
+
+			// Closing the workflow succeeds, leaving waiter 1 FAILED-canceled and scheduling waiter 2.
+			env.completeRun(runID, ms, wftCompleted.GetEventId(), []byte("done"))
+			if chasmMode {
+				wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(t.Context())
+				require.NoError(t, err)
+				_, cb1, ok := wf.FindResultSubscription(ctx, req1)
+				require.True(t, ok)
+				require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, cb1.Status)
+				require.NotNil(t, cb1.GetLastAttemptFailure().GetCanceledFailureInfo())
+				_, cb2, ok := wf.FindResultSubscription(ctx, req2)
+				require.True(t, ok)
+				require.Equal(t, callbackspb.CALLBACK_STATUS_SCHEDULED, cb2.Status)
+			} else {
+				coll := hsmcallbacks.MachineCollection(ms.HSM())
+				cb1, err := coll.Data("cb-" + req1 + "-0")
+				require.NoError(t, err)
+				require.Equal(t, enumsspb.CALLBACK_STATE_FAILED, cb1.State())
+				require.NotNil(t, cb1.GetLastAttemptFailure().GetCanceledFailureInfo())
+				cb2, err := coll.Data("cb-" + req2 + "-0")
+				require.NoError(t, err)
+				require.Equal(t, enumsspb.CALLBACK_STATE_SCHEDULED, cb2.State())
+			}
 			env.cache.requireNoLeakedLocks(t)
 		})
 
@@ -2026,7 +2047,7 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 		})
 	}
 
-	t.Run("cancel never touches unrelated workflow ID reuse and cancels closed old chain in place", func(t *testing.T) {
+	t.Run("cancel never touches unrelated workflow ID reuse and returns nil without writes on closed old chain", func(t *testing.T) {
 		t.Parallel()
 		env := newAPITestEnv(t, true)
 		c1ID := uuid.NewString()
@@ -2044,7 +2065,7 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		// C1 -> C2, then C2 closes (callback transitions to SCHEDULED).
+		// C1 -> C2, then C2 closes (subscription is already settled).
 		c2Run, c2MS, c2WFT := env.continueAsNewRun(c1ID, c1MS, c1WFT.GetEventId())
 		env.completeRun(c2Run.key.RunID, c2MS, c2WFT.GetEventId(), []byte("c2-done"))
 
@@ -2065,7 +2086,7 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 1, r2Run.updateCalls)
 
-		// Cancel C1's subscription: must not mutate R2; walks C1 -> C2 and cancels SCHEDULED callback in place.
+		// Cancel C1's subscription: must not mutate R2; walks C1 -> closed C2 and returns nil with zero writes.
 		require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller1, sub1.Subscribed.Token))
 
 		require.Equal(t, 1, r2Run.updateCalls, "unrelated reuse R2 must not be mutated")
@@ -2075,22 +2096,13 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, callbackspb.CALLBACK_STATUS_STANDBY, r2CB.Status)
 
-		require.Equal(t, 1, c2Run.updateCalls)
-		require.Empty(t, c2Run.committedEvents, "closed run cancellation must not append history events")
-		c2WF, c2Ctx, err := c2MS.ChasmWorkflowComponentReadOnly(t.Context())
-		require.NoError(t, err)
-		_, c2CB, ok := c2WF.FindResultSubscription(c2Ctx, req1)
-		require.True(t, ok)
-		require.Equal(t, callbackspb.CALLBACK_STATUS_CANCELED, c2CB.Status)
-
-		// Subsequent Cancel sees already-canceled callback and writes nothing.
-		require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller1, sub1.Subscribed.Token))
-		require.Equal(t, 1, c2Run.updateCalls)
+		require.Zero(t, c2Run.updateCalls, "closed terminal run must not be mutated on cancel")
+		require.Empty(t, c2Run.committedEvents)
 		env.cache.requireSingleRunLockAtATime(t)
 		env.cache.requireNoLeakedLocks(t)
 	})
 
-	t.Run("cancel on already delivered callback or purged run returns nil with zero writes", func(t *testing.T) {
+	t.Run("cancel on closed run or purged run returns nil with zero writes", func(t *testing.T) {
 		t.Parallel()
 		env := newAPITestEnv(t, true)
 		runID := uuid.NewString()
@@ -2108,19 +2120,6 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 		})
 		require.NoError(t, err)
 		env.completeRun(runID, ms, wftCompleted.GetEventId(), []byte("done"))
-
-		// Mark callback SUCCEEDED (already delivered).
-		wf, chasmCtx, err := ms.ChasmWorkflowComponent(t.Context())
-		require.NoError(t, err)
-		key, _, ok := wf.FindResultSubscription(chasmCtx, reqID)
-		require.True(t, ok)
-		require.NoError(t, chasmcallback.TransitionSucceeded.Apply(
-			wf.Callbacks[key].Get(chasmCtx),
-			chasmCtx,
-			chasmcallback.EventSucceeded{Time: time.Now().UTC()},
-		))
-		_, _, err = ms.CloseTransactionAsMutation(t.Context(), historyi.TransactionPolicyActive)
-		require.NoError(t, err)
 
 		require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller, sub.Subscribed.Token))
 		require.Equal(t, 1, run.updateCalls)
@@ -2204,66 +2203,8 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 
 		require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller1, sub1.Subscribed.Token))
 		require.Zero(t, r2Run.updateCalls)
-		require.Equal(t, 1, c2Run.updateCalls)
-
-		c2WF, c2Ctx, err := c2MS.ChasmWorkflowComponentReadOnly(t.Context())
-		require.NoError(t, err)
-		_, cb, ok := c2WF.FindResultSubscription(c2Ctx, req1)
-		require.True(t, ok)
-		require.Equal(t, callbackspb.CALLBACK_STATUS_CANCELED, cb.Status)
+		require.Zero(t, c2Run.updateCalls)
 		env.cache.requireSingleRunLockAtATime(t)
-		env.cache.requireNoLeakedLocks(t)
-	})
-
-	t.Run("Cancel retries on ConditionFailedError when closed run races with delivery backoff", func(t *testing.T) {
-		t.Parallel()
-		env := newAPITestEnv(t, true)
-		runID := uuid.NewString()
-		run, ms, wftCompleted := env.addRealOpenRun(runID)
-		env.setCurrentRun(runID)
-
-		reqID := uuid.NewString()
-		caller := newCallerInfo(env.namespaceID, reqID)
-		sub, err := Start(t.Context(), env.testShard, env.checker, StartRequest{
-			NamespaceID: env.namespaceID,
-			Caller:      caller,
-			Target:      &commonpb.WorkflowExecution{WorkflowId: env.workflowID},
-			RequestID:   reqID,
-			Callback:    makeCallerCallback(t, caller, reqID, true),
-		})
-		require.NoError(t, err)
-		env.completeRun(runID, ms, wftCompleted.GetEventId(), []byte("done"))
-
-		// Simulate a single optimistic-concurrency conflict on commit (delivery task concurrently
-		// moved callback from SCHEDULED to BACKING_OFF), then reload and succeed.
-		var attempts atomic.Int32
-		run.updateFn = func(ctx context.Context, m historyi.MutableState) error {
-			if attempts.Add(1) == 1 {
-				// Simulate concurrent persistence update by resetting callback to BACKING_OFF on reload.
-				wf, chasmCtx, err := m.ChasmWorkflowComponent(ctx)
-				if err != nil {
-					return err
-				}
-				key, _, ok := wf.FindResultSubscription(chasmCtx, reqID)
-				if !ok {
-					return serviceerror.NewInternal("missing subscription")
-				}
-				wf.Callbacks[key].Get(chasmCtx).SetStateMachineState(callbackspb.CALLBACK_STATUS_BACKING_OFF)
-				return &persistence.ConditionFailedError{Msg: "concurrent delivery update"}
-			}
-			_, _, err := m.(*workflow.MutableStateImpl).CloseTransactionAsMutation(ctx, historyi.TransactionPolicyActive)
-			return err
-		}
-
-		require.NoError(t, Cancel(t.Context(), env.testShard, env.checker, env.namespaceID, caller, sub.Subscribed.Token))
-		require.Equal(t, int32(2), attempts.Load())
-		require.Equal(t, 1, run.clearCalls)
-
-		wf, ctx, err := ms.ChasmWorkflowComponentReadOnly(t.Context())
-		require.NoError(t, err)
-		_, cb, ok := wf.FindResultSubscription(ctx, reqID)
-		require.True(t, ok)
-		require.Equal(t, callbackspb.CALLBACK_STATUS_CANCELED, cb.Status)
 		env.cache.requireNoLeakedLocks(t)
 	})
 
@@ -2299,7 +2240,8 @@ func TestCancelLifecycleChainResolutionAndWorkflowIDReuse(t *testing.T) {
 		require.NoError(t, err)
 		_, cb, ok := c2WF.FindResultSubscription(c2Ctx, reqID)
 		require.True(t, ok)
-		require.Equal(t, callbackspb.CALLBACK_STATUS_CANCELED, cb.Status)
+		require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, cb.Status)
+		require.NotNil(t, cb.GetLastAttemptFailure().GetCanceledFailureInfo())
 		env.cache.requireSingleRunLockAtATime(t)
 		env.cache.requireNoLeakedLocks(t)
 	})

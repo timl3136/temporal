@@ -185,37 +185,35 @@ func TestValidTransitions(t *testing.T) {
 func TestTransitionCanceled(t *testing.T) {
 	t.Parallel()
 
-	for _, status := range []callbackspb.CallbackStatus{
-		callbackspb.CALLBACK_STATUS_STANDBY,
-		callbackspb.CALLBACK_STATUS_SCHEDULED,
-		callbackspb.CALLBACK_STATUS_BACKING_OFF,
-	} {
-		t.Run("from_"+status.String(), func(t *testing.T) {
-			t.Parallel()
-			cb := &Callback{
-				CallbackState: &callbackspb.CallbackState{
-					Status: status,
-					Callback: &callbackspb.Callback{
-						Variant: &callbackspb.Callback_Nexus_{
-							Nexus: &callbackspb.Callback_Nexus{Url: "temporal://system"},
-						},
+	t.Run("from_STANDBY", func(t *testing.T) {
+		t.Parallel()
+		cb := &Callback{
+			CallbackState: &callbackspb.CallbackState{
+				Status: callbackspb.CALLBACK_STATUS_STANDBY,
+				Callback: &callbackspb.Callback{
+					Variant: &callbackspb.Callback_Nexus_{
+						Nexus: &callbackspb.Callback_Nexus{Url: "temporal://system"},
 					},
 				},
-			}
-			mctx := &chasm.MockMutableContext{}
-			require.True(t, TransitionCanceled.Possible(cb))
-			require.NoError(t, TransitionCanceled.Apply(cb, mctx, EventCanceled{}))
-			require.Equal(t, callbackspb.CALLBACK_STATUS_CANCELED, cb.StateMachineState())
-			require.Equal(t, chasm.LifecycleStateFailed, cb.LifecycleState(mctx))
-			require.Nil(t, cb.NextAttemptScheduleTime)
-			require.Empty(t, mctx.Tasks)
-		})
-	}
+			},
+		}
+		mctx := &chasm.MockMutableContext{}
+		require.True(t, TransitionCanceled.Possible(cb))
+		require.NoError(t, TransitionCanceled.Apply(cb, mctx, EventCanceled{}))
+		require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, cb.StateMachineState())
+		require.Equal(t, chasm.LifecycleStateFailed, cb.LifecycleState(mctx))
+		require.NotNil(t, cb.GetLastAttemptFailure().GetCanceledFailureInfo())
+		require.Equal(t, "result subscription canceled", cb.GetLastAttemptFailure().GetMessage())
+		require.Zero(t, cb.GetAttempt())
+		require.Nil(t, cb.NextAttemptScheduleTime)
+		require.Empty(t, mctx.Tasks)
+	})
 
 	for _, status := range []callbackspb.CallbackStatus{
+		callbackspb.CALLBACK_STATUS_SCHEDULED,
+		callbackspb.CALLBACK_STATUS_BACKING_OFF,
 		callbackspb.CALLBACK_STATUS_SUCCEEDED,
 		callbackspb.CALLBACK_STATUS_FAILED,
-		callbackspb.CALLBACK_STATUS_CANCELED,
 	} {
 		t.Run("rejected_from_"+status.String(), func(t *testing.T) {
 			t.Parallel()

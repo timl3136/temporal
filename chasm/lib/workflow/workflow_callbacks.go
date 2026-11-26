@@ -80,7 +80,8 @@ func (w *Workflow) CancelableResultSubscriptionKeys(
 	return keys
 }
 
-// CancelResultSubscriptions transitions the callbacks at keys to CALLBACK_STATUS_CANCELED.
+// CancelResultSubscriptions transitions the callbacks at keys to CALLBACK_STATUS_FAILED
+// with a canceled failure.
 func (w *Workflow) CancelResultSubscriptions(
 	ctx chasm.MutableContext,
 	keys []string,

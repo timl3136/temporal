@@ -119,7 +119,7 @@ func (c Callback) progress() (int, int32, error) {
 	case enumsspb.CALLBACK_STATE_SCHEDULED:
 		// We've made slightly more progress if we transitioned from backing off to scheduled.
 		return 2, c.GetAttempt()*2 + 1, nil
-	case enumsspb.CALLBACK_STATE_FAILED, enumsspb.CALLBACK_STATE_SUCCEEDED, enumsspb.CALLBACK_STATE_CANCELED:
+	case enumsspb.CALLBACK_STATE_FAILED, enumsspb.CALLBACK_STATE_SUCCEEDED:
 		// Consider any terminal state as "max progress", we'll rely on last update namespace failover version to break
 		// the tie when comparing two states.
 		return terminalStage, 0, nil
@@ -277,14 +277,23 @@ var TransitionSucceeded = hsm.NewTransition(
 type EventCanceled struct{}
 
 var TransitionCanceled = hsm.NewTransition(
-	[]enumsspb.CallbackState{
-		enumsspb.CALLBACK_STATE_STANDBY,
-		enumsspb.CALLBACK_STATE_SCHEDULED,
-		enumsspb.CALLBACK_STATE_BACKING_OFF,
-	},
-	enumsspb.CALLBACK_STATE_CANCELED,
+	[]enumsspb.CallbackState{enumsspb.CALLBACK_STATE_STANDBY},
+	enumsspb.CALLBACK_STATE_FAILED,
 	func(cb Callback, _ EventCanceled) (hsm.TransitionOutput, error) {
 		cb.NextAttemptScheduleTime = nil
+		cb.LastAttemptFailure = &failurepb.Failure{
+			Message: "result subscription canceled",
+			FailureInfo: &failurepb.Failure_CanceledFailureInfo{
+				CanceledFailureInfo: &failurepb.CanceledFailureInfo{},
+			},
+		}
 		return cb.output()
 	},
 )
+
+// Cancel transitions the callback with id in coll via TransitionCanceled.
+func Cancel(coll hsm.Collection[Callback], id string) error {
+	return coll.Transition(id, func(cb Callback) (hsm.TransitionOutput, error) {
+		return TransitionCanceled.Apply(cb, EventCanceled{})
+	})
+}

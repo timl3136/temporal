@@ -53,8 +53,6 @@ enum CallbackStatus {
   CALLBACK_STATUS_FAILED = 4;
   // Callback has succeeded.
   CALLBACK_STATUS_SUCCEEDED = 5;
-  // Callback has been canceled and will not be delivered.
-  CALLBACK_STATUS_CANCELED = 6;
 }
 
 message Callback {
