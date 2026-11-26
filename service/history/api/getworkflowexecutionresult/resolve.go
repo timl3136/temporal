@@ -23,7 +23,8 @@ import (
 
 const (
 	maxStaleCurrentRunAttempts = 5
-	maxChainWalkHops           = 100
+	// shortcut: chains longer than 100 runs fail after workflow ID reuse; raise if long continue-as-new chains need pinned waits.
+	maxChainWalkHops = 100
 )
 
 var errDifferentChain = errors.New("target workflow execution belongs to a different execution chain")
@@ -47,10 +48,9 @@ type resolvedTarget struct {
 type resolveActionFunc func(lease api.WorkflowLease, target resolvedTarget) (*api.UpdateWorkflowAction, error)
 
 type resolveStep struct {
-	target     resolvedTarget
-	follow     bool
-	firstRunID string
-	nextRunID  string
+	target    resolvedTarget
+	follow    bool
+	nextRunID string
 }
 
 // resolveTarget resolves req.target under its workflow lease and invokes action if non-nil.
@@ -115,8 +115,8 @@ func resolveExplicitRun(
 		return step.target, nil
 	}
 	// The requested run's lease has been released before acquiring the current run's lease.
-	if step.firstRunID != "" {
-		resolved, err := resolveCurrent(ctx, shard, checker, req, step.firstRunID, action)
+	if step.target.firstRunID != "" {
+		resolved, err := resolveCurrent(ctx, shard, checker, req, step.target.firstRunID, action)
 		if err == nil {
 			return resolved, nil
 		}
@@ -236,11 +236,7 @@ func resolveOnce(
 		workflowKey,
 		func(lease api.WorkflowLease) (*api.UpdateWorkflowAction, error) {
 			ms := lease.GetMutableState()
-			actualKey, err := resolvedWorkflowKey(req.namespaceID, req.target.GetWorkflowId(), lease)
-			if err != nil {
-				cleanErr = err
-				return &api.UpdateWorkflowAction{Noop: true}, nil
-			}
+			actualKey := lease.GetContext().GetWorkflowKey()
 			if ms.GetExecutionState().GetState() == enumsspb.WORKFLOW_EXECUTION_STATE_ZOMBIE {
 				cleanErr = serviceerror.NewFailedPrecondition("target workflow execution is in zombie state")
 				return &api.UpdateWorkflowAction{Noop: true}, nil
@@ -269,7 +265,7 @@ func resolveOnce(
 					workflowKey: actualKey,
 					firstRunID:  firstRunID,
 				}
-				return runResolvedAction(lease, step.target, false, action)
+				return runResolvedAction(lease, step.target, action)
 			}
 
 			closeEvent, nextRunID, superseded, err := readTerminalCloseEvent(ctx, ms, explicit)
@@ -280,7 +276,7 @@ func resolveOnce(
 			if superseded {
 				if explicit {
 					step.follow = true
-					step.firstRunID = firstRunID
+					step.target.firstRunID = firstRunID
 					step.nextRunID = nextRunID
 					return &api.UpdateWorkflowAction{Noop: true}, nil
 				}
@@ -297,7 +293,7 @@ func resolveOnce(
 				firstRunID:  firstRunID,
 				closeEvent:  closeEvent,
 			}
-			return runResolvedAction(lease, step.target, true, action)
+			return runResolvedAction(lease, step.target, action)
 		},
 		nil,
 		shard,
@@ -340,9 +336,9 @@ func readTerminalCloseEvent(
 func runResolvedAction(
 	lease api.WorkflowLease,
 	resolved resolvedTarget,
-	closed bool,
 	action resolveActionFunc,
 ) (*api.UpdateWorkflowAction, error) {
+	closed := resolved.closeEvent != nil
 	if action == nil {
 		return &api.UpdateWorkflowAction{Noop: true}, nil
 	}
@@ -359,21 +355,6 @@ func runResolvedAction(
 	return postActions, nil
 }
 
-func resolvedWorkflowKey(
-	namespaceID namespace.ID,
-	workflowID string,
-	lease api.WorkflowLease,
-) (definition.WorkflowKey, error) {
-	runID := lease.GetMutableState().GetExecutionState().GetRunId()
-	if runID == "" {
-		runID = lease.GetContext().GetWorkflowKey().RunID
-	}
-	if runID == "" {
-		return definition.WorkflowKey{}, serviceerror.NewInternal("workflow execution is missing run ID")
-	}
-	return definition.NewWorkflowKey(namespaceID.String(), workflowID, runID), nil
-}
-
 func mutableStateSuccessor(ms historyi.MutableState, followReset bool) (string, bool) {
 	info := ms.GetExecutionInfo()
 	runID := ms.GetExecutionState().GetRunId()
@@ -385,6 +366,7 @@ func mutableStateSuccessor(ms historyi.MutableState, followReset bool) (string, 
 	if newRunID := info.GetNewExecutionRunId(); newRunID != "" && newRunID != runID {
 		return newRunID, true
 	}
+	// shortcut: a run terminated by a reset of an earlier base has no forward link; after workflow ID reuse this returns FAILED_PRECONDITION. Upgrade by walking back to the base run's ResetRunId.
 	if followReset && info.GetWorkflowWasReset() {
 		return "", true
 	}
