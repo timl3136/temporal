@@ -693,6 +693,21 @@ func (mr *MockMutableStateMockRecorder) AddWorkflowExecutionOptionsUpdatedEvent(
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddWorkflowExecutionOptionsUpdatedEvent", reflect.TypeOf((*MockMutableState)(nil).AddWorkflowExecutionOptionsUpdatedEvent), versioningOverride, unsetVersioningOverride, attachRequestID, attachCompletionCallbacks, links, identity, priority, timeSkippingConfig, timeSkippingConfigUpdated, workflowUpdateOptions)
 }
 
+// AddWorkflowExecutionOptionsUpdatedEventWithAttributes mocks base method.
+func (m *MockMutableState) AddWorkflowExecutionOptionsUpdatedEventWithAttributes(attributes *history.WorkflowExecutionOptionsUpdatedEventAttributes, links []*common.Link) (*history.HistoryEvent, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AddWorkflowExecutionOptionsUpdatedEventWithAttributes", attributes, links)
+	ret0, _ := ret[0].(*history.HistoryEvent)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// AddWorkflowExecutionOptionsUpdatedEventWithAttributes indicates an expected call of AddWorkflowExecutionOptionsUpdatedEventWithAttributes.
+func (mr *MockMutableStateMockRecorder) AddWorkflowExecutionOptionsUpdatedEventWithAttributes(attributes, links any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddWorkflowExecutionOptionsUpdatedEventWithAttributes", reflect.TypeOf((*MockMutableState)(nil).AddWorkflowExecutionOptionsUpdatedEventWithAttributes), attributes, links)
+}
+
 // AddWorkflowExecutionPausedEvent mocks base method.
 func (m *MockMutableState) AddWorkflowExecutionPausedEvent(identity, reason, requestID string) (*history.HistoryEvent, error) {
 	m.ctrl.T.Helper()

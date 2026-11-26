@@ -53,6 +53,8 @@ enum CallbackStatus {
   CALLBACK_STATUS_FAILED = 4;
   // Callback has succeeded.
   CALLBACK_STATUS_SUCCEEDED = 5;
+  // Callback has been canceled and will not be delivered.
+  CALLBACK_STATUS_CANCELED = 6;
 }
 
 message Callback {
@@ -84,6 +86,8 @@ message Callback {
   }
 
   repeated temporal.api.common.v1.Link links = 100;
+  // Server-authored metadata for a GetWorkflowExecutionResult subscription.
+  temporal.api.common.v1.Callback.ResultSubscription result_subscription = 101;
 }
 
 // Contains denormalized metadata about callbacks attached to a component. Used

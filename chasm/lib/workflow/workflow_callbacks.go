@@ -32,3 +32,71 @@ func (w *Workflow) GetNexusCompletion(
 	// Retrieve the completion data from the underlying mutable state via MSPointer.
 	return w.MSPointer.GetNexusCompletion(ctx, requestID)
 }
+
+// FindResultSubscription returns the CHASM map key and callback whose ResultSubscription
+// matches requestID.
+func (w *Workflow) FindResultSubscription(
+	ctx chasm.Context,
+	requestID string,
+) (string, *callback.Callback, bool) {
+	if requestID == "" {
+		return "", nil, false
+	}
+	for key, field := range w.Callbacks {
+		cb, ok := field.TryGet(ctx)
+		if !ok {
+			continue
+		}
+		if cb.GetCallback().GetResultSubscription().GetRequestId() == requestID {
+			return key, cb, true
+		}
+	}
+	return "", nil, false
+}
+
+// CancelableResultSubscriptionKeys returns the CHASM map keys of callbacks whose
+// ResultSubscription.RequestId is in requestIDs and whose status can transition to canceled.
+func (w *Workflow) CancelableResultSubscriptionKeys(
+	ctx chasm.Context,
+	requestIDs map[string]struct{},
+) []string {
+	if len(requestIDs) == 0 || len(w.Callbacks) == 0 {
+		return nil
+	}
+	var keys []string
+	for key, field := range w.Callbacks {
+		cb, ok := field.TryGet(ctx)
+		if !ok {
+			continue
+		}
+		subReqID := cb.GetCallback().GetResultSubscription().GetRequestId()
+		if _, ok := requestIDs[subReqID]; !ok {
+			continue
+		}
+		if callback.TransitionCanceled.Possible(cb) {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// CancelResultSubscriptions transitions the callbacks at keys to CALLBACK_STATUS_CANCELED.
+func (w *Workflow) CancelResultSubscriptions(
+	ctx chasm.MutableContext,
+	keys []string,
+) error {
+	for _, key := range keys {
+		field, ok := w.Callbacks[key]
+		if !ok {
+			continue
+		}
+		cb := field.Get(ctx)
+		if !callback.TransitionCanceled.Possible(cb) {
+			continue
+		}
+		if err := callback.TransitionCanceled.Apply(cb, ctx, callback.EventCanceled{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}

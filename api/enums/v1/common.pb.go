@@ -152,6 +152,8 @@ const (
 	CALLBACK_STATE_FAILED CallbackState = 4
 	// Callback has succeeded.
 	CALLBACK_STATE_SUCCEEDED CallbackState = 5
+	// Callback has been canceled and will not be delivered.
+	CALLBACK_STATE_CANCELED CallbackState = 6
 )
 
 // Enum value maps for CallbackState.
@@ -163,6 +165,7 @@ var (
 		3: "CALLBACK_STATE_BACKING_OFF",
 		4: "CALLBACK_STATE_FAILED",
 		5: "CALLBACK_STATE_SUCCEEDED",
+		6: "CALLBACK_STATE_CANCELED",
 	}
 	CallbackState_value = map[string]int32{
 		"CALLBACK_STATE_UNSPECIFIED": 0,
@@ -171,6 +174,7 @@ var (
 		"CALLBACK_STATE_BACKING_OFF": 3,
 		"CALLBACK_STATE_FAILED":      4,
 		"CALLBACK_STATE_SUCCEEDED":   5,
+		"CALLBACK_STATE_CANCELED":    6,
 	}
 )
 
@@ -194,6 +198,8 @@ func (x CallbackState) String() string {
 		return "Failed"
 	case CALLBACK_STATE_SUCCEEDED:
 		return "Succeeded"
+	case CALLBACK_STATE_CANCELED:
+		return "Canceled"
 	default:
 		return strconv.Itoa(int(x))
 	}
@@ -228,14 +234,15 @@ const file_temporal_server_api_enums_v1_common_proto_rawDesc = "" +
 	" DEAD_LETTER_QUEUE_TYPE_NAMESPACE\x10\x02*d\n" +
 	"\x0eChecksumFlavor\x12\x1f\n" +
 	"\x1bCHECKSUM_FLAVOR_UNSPECIFIED\x10\x00\x121\n" +
-	"-CHECKSUM_FLAVOR_IEEE_CRC32_OVER_PROTO3_BINARY\x10\x01*\xc2\x01\n" +
+	"-CHECKSUM_FLAVOR_IEEE_CRC32_OVER_PROTO3_BINARY\x10\x01*\xdf\x01\n" +
 	"\rCallbackState\x12\x1e\n" +
 	"\x1aCALLBACK_STATE_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16CALLBACK_STATE_STANDBY\x10\x01\x12\x1c\n" +
 	"\x18CALLBACK_STATE_SCHEDULED\x10\x02\x12\x1e\n" +
 	"\x1aCALLBACK_STATE_BACKING_OFF\x10\x03\x12\x19\n" +
 	"\x15CALLBACK_STATE_FAILED\x10\x04\x12\x1c\n" +
-	"\x18CALLBACK_STATE_SUCCEEDED\x10\x05B*Z(go.temporal.io/server/api/enums/v1;enumsb\x06proto3"
+	"\x18CALLBACK_STATE_SUCCEEDED\x10\x05\x12\x1b\n" +
+	"\x17CALLBACK_STATE_CANCELED\x10\x06B*Z(go.temporal.io/server/api/enums/v1;enumsb\x06proto3"
 
 var (
 	file_temporal_server_api_enums_v1_common_proto_rawDescOnce sync.Once

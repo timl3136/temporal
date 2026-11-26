@@ -29,4 +29,6 @@ enum CallbackState {
   CALLBACK_STATE_FAILED = 4;
   // Callback has succeeded.
   CALLBACK_STATE_SUCCEEDED = 5;
+  // Callback has been canceled and will not be delivered.
+  CALLBACK_STATE_CANCELED = 6;
 }

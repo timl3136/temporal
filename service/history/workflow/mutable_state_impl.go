@@ -3597,7 +3597,8 @@ func (ms *MutableStateImpl) addCompletionCallbacksHsm(
 	}
 	for idx, cb := range completionCallbacks {
 		persistenceCB := &persistencespb.Callback{
-			Links: cb.GetLinks(),
+			Links:              cb.GetLinks(),
+			ResultSubscription: common.CloneProto(cb.GetResultSubscription()),
 		}
 		switch variant := cb.Variant.(type) {
 		case *commonpb.Callback_Nexus_:
@@ -6083,6 +6084,38 @@ func (ms *MutableStateImpl) AddWorkflowExecutionOptionsUpdatedEvent(
 		timeSkippingConfigUpdated,
 		workflowUpdateOptions,
 	)
+	return ms.applyWorkflowExecutionOptionsUpdatedEventWithMetrics(event, timeSkippingConfigUpdated)
+}
+
+func (ms *MutableStateImpl) AddWorkflowExecutionOptionsUpdatedEventWithAttributes(
+	attributes *historypb.WorkflowExecutionOptionsUpdatedEventAttributes,
+	links []*commonpb.Link,
+) (*historypb.HistoryEvent, error) {
+	if err := ms.checkMutability(tag.WorkflowActionWorkflowOptionsUpdated); err != nil {
+		return nil, err
+	}
+	attrs := common.CloneProto(attributes)
+	if attrs == nil {
+		attrs = &historypb.WorkflowExecutionOptionsUpdatedEventAttributes{}
+	}
+	attrs.VersioningOverride = worker_versioning.ConvertOverrideToV32(attrs.GetVersioningOverride())
+	event := ms.hBuilder.AddHistoryEvent(
+		enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+		func(e *historypb.HistoryEvent) {
+			e.Attributes = &historypb.HistoryEvent_WorkflowExecutionOptionsUpdatedEventAttributes{
+				WorkflowExecutionOptionsUpdatedEventAttributes: attrs,
+			}
+			e.Links = common.CloneProtoSlice(links)
+			e.WorkerMayIgnore = true
+		},
+	)
+	return ms.applyWorkflowExecutionOptionsUpdatedEventWithMetrics(event, attrs.GetTimeSkippingConfigUpdated())
+}
+
+func (ms *MutableStateImpl) applyWorkflowExecutionOptionsUpdatedEventWithMetrics(
+	event *historypb.HistoryEvent,
+	timeSkippingConfigUpdated bool,
+) (*historypb.HistoryEvent, error) {
 	prevEffectiveVersioningBehavior := ms.GetEffectiveVersioningBehavior()
 	prevEffectiveDeployment := ms.GetEffectiveDeployment()
 
@@ -6133,6 +6166,13 @@ func (ms *MutableStateImpl) ApplyWorkflowExecutionOptionsUpdatedEvent(event *his
 		event,
 		attributes.GetAttachedRequestId(),
 		attributes.GetAttachedCompletionCallbacks(),
+	); err != nil {
+		return err
+	}
+
+	// Cancel result subscription callbacks.
+	if err := ms.cancelResultSubscriptionCallbacks(
+		attributes.GetCanceledResultSubscriptionRequestIds(),
 	); err != nil {
 		return err
 	}
@@ -7491,8 +7531,11 @@ func (ms *MutableStateImpl) processCloseCallbacksHsm() error {
 		if err != nil {
 			return err
 		}
-		// Only try to trigger "WorkflowClosed" callbacks.
+		// Only try to trigger "WorkflowClosed" callbacks that are still in STANDBY state.
 		if _, ok := cb.Trigger.Variant.(*persistencespb.CallbackInfo_Trigger_WorkflowClosed); !ok {
+			continue
+		}
+		if cb.State() != enumsspb.CALLBACK_STATE_STANDBY {
 			continue
 		}
 		err = coll.Transition(node.Key.ID, func(cb callbacks.Callback) (hsm.TransitionOutput, error) {
@@ -7500,6 +7543,61 @@ func (ms *MutableStateImpl) processCloseCallbacksHsm() error {
 		})
 		if err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (ms *MutableStateImpl) cancelResultSubscriptionCallbacks(requestIDs []string) error {
+	if len(requestIDs) == 0 {
+		return nil
+	}
+	cancelSet := make(map[string]struct{}, len(requestIDs))
+	for _, id := range requestIDs {
+		if id != "" {
+			cancelSet[id] = struct{}{}
+		}
+	}
+	if len(cancelSet) == 0 {
+		return nil
+	}
+
+	if ms.ChasmEnabled() {
+		wf, readCtx, err := ms.ChasmWorkflowComponentReadOnly(context.Background())
+		if err != nil {
+			return err
+		}
+		if keys := wf.CancelableResultSubscriptionKeys(readCtx, cancelSet); len(keys) > 0 {
+			wf, writeCtx, err := ms.ChasmWorkflowComponent(context.Background())
+			if err != nil {
+				return err
+			}
+			if err := wf.CancelResultSubscriptions(writeCtx, keys); err != nil {
+				return err
+			}
+		}
+	}
+
+	if ms.HSM() != nil {
+		coll := callbacks.MachineCollection(ms.HSM())
+		for _, node := range coll.List() {
+			cb, err := coll.Data(node.Key.ID)
+			if err != nil {
+				return err
+			}
+			subReqID := cb.GetCallback().GetResultSubscription().GetRequestId()
+			if _, ok := cancelSet[subReqID]; !ok {
+				continue
+			}
+			if !callbacks.TransitionCanceled.Possible(cb) {
+				continue
+			}
+			//nolint:staticcheck // SA1019: HSM callbacks remain supported alongside CHASM.
+			if err := coll.Transition(node.Key.ID, func(cb callbacks.Callback) (hsm.TransitionOutput, error) {
+				return callbacks.TransitionCanceled.Apply(cb, callbacks.EventCanceled{})
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

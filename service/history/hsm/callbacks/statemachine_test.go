@@ -107,6 +107,52 @@ func TestValidTransitions(t *testing.T) {
 	require.Empty(t, out.Tasks)
 }
 
+func TestTransitionCanceled(t *testing.T) {
+	t.Parallel()
+
+	for _, state := range []enumsspb.CallbackState{
+		enumsspb.CALLBACK_STATE_STANDBY,
+		enumsspb.CALLBACK_STATE_SCHEDULED,
+		enumsspb.CALLBACK_STATE_BACKING_OFF,
+	} {
+		t.Run("from_"+state.String(), func(t *testing.T) {
+			t.Parallel()
+			cb := callbacks.Callback{
+				CallbackInfo: &persistencespb.CallbackInfo{
+					State: state,
+					Callback: &persistencespb.Callback{
+						Variant: &persistencespb.Callback_Nexus_{
+							Nexus: &persistencespb.Callback_Nexus{Url: "temporal://system"},
+						},
+					},
+				},
+			}
+			require.True(t, callbacks.TransitionCanceled.Possible(cb))
+			out, err := callbacks.TransitionCanceled.Apply(cb, callbacks.EventCanceled{})
+			require.NoError(t, err)
+			require.Equal(t, enumsspb.CALLBACK_STATE_CANCELED, cb.State())
+			require.Nil(t, cb.NextAttemptScheduleTime)
+			require.Empty(t, out.Tasks)
+		})
+	}
+
+	for _, state := range []enumsspb.CallbackState{
+		enumsspb.CALLBACK_STATE_SUCCEEDED,
+		enumsspb.CALLBACK_STATE_FAILED,
+		enumsspb.CALLBACK_STATE_CANCELED,
+	} {
+		t.Run("rejected_from_"+state.String(), func(t *testing.T) {
+			t.Parallel()
+			cb := callbacks.Callback{
+				CallbackInfo: &persistencespb.CallbackInfo{State: state},
+			}
+			require.False(t, callbacks.TransitionCanceled.Possible(cb))
+			_, err := callbacks.TransitionCanceled.Apply(cb, callbacks.EventCanceled{})
+			require.ErrorIs(t, err, hsm.ErrInvalidTransition)
+		})
+	}
+}
+
 func TestCompareState(t *testing.T) {
 	reg := hsm.NewRegistry()
 	require.NoError(t, callbacks.RegisterStateMachine(reg))
@@ -158,6 +204,24 @@ func TestCompareState(t *testing.T) {
 			s2:        enumsspb.CALLBACK_STATE_SCHEDULED,
 			attempts2: 1,
 			sign:      -1,
+		},
+		{
+			name: "standby < canceled",
+			s1:   enumsspb.CALLBACK_STATE_STANDBY,
+			s2:   enumsspb.CALLBACK_STATE_CANCELED,
+			sign: -1,
+		},
+		{
+			name: "canceled = canceled",
+			s1:   enumsspb.CALLBACK_STATE_CANCELED,
+			s2:   enumsspb.CALLBACK_STATE_CANCELED,
+			sign: 0,
+		},
+		{
+			name:        "canceled not comparable to succeeded",
+			s1:          enumsspb.CALLBACK_STATE_CANCELED,
+			s2:          enumsspb.CALLBACK_STATE_SUCCEEDED,
+			expectError: true,
 		},
 	}
 

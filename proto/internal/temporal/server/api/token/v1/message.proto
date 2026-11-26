@@ -93,3 +93,19 @@ message NexusOperationCompletion {
   // Reference to the CHASM component to be informed of the completion.
   bytes component_ref = 6;
 }
+
+// A token identifying an attached GetWorkflowExecutionResult subscription.
+message ResultSubscriptionToken {
+  // Token format version; starts at 1.
+  int32 version = 1;
+  // Target namespace ID.
+  string namespace_id = 2;
+  // Target workflow ID.
+  string workflow_id = 3;
+  // First execution run ID of the target workflow chain.
+  string first_run_id = 4;
+  // Target run ID resolved when the subscription was attached.
+  string resolved_run_id = 5;
+  // Caller's scheduled Nexus operation request ID.
+  string request_id = 6;
+}

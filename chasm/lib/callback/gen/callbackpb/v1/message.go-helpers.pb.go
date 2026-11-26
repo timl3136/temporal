@@ -126,6 +126,7 @@ var (
 		"BackingOff":  3,
 		"Failed":      4,
 		"Succeeded":   5,
+		"Canceled":    6,
 	}
 )
 

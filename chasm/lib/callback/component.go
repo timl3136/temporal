@@ -65,7 +65,7 @@ func (c *Callback) LifecycleState(_ chasm.Context) chasm.LifecycleState {
 	switch c.Status {
 	case callbackspb.CALLBACK_STATUS_SUCCEEDED:
 		return chasm.LifecycleStateCompleted
-	case callbackspb.CALLBACK_STATUS_FAILED:
+	case callbackspb.CALLBACK_STATUS_FAILED, callbackspb.CALLBACK_STATUS_CANCELED:
 		return chasm.LifecycleStateFailed
 	default:
 		return chasm.LifecycleStateRunning
@@ -227,7 +227,8 @@ func (c *Callback) ToAPICallback() (*commonpb.Callback, error) {
 	res := &commonpb.Callback{
 		// NOTE: We intentionally do not include links that were added at runtime,
 		// e.g. when the callback was invoked. Those are included in ToAPICallbackInfo.
-		Links: common.CloneProtoSlice(chasmCB.GetLinks()),
+		Links:              common.CloneProtoSlice(chasmCB.GetLinks()),
+		ResultSubscription: common.CloneProto(chasmCB.GetResultSubscription()),
 	}
 
 	switch variant := chasmCB.GetVariant().(type) {
@@ -286,7 +287,7 @@ func (c *Callback) apiStatus() (enumspb.CallbackState, error) {
 		return enumspb.CALLBACK_STATE_SCHEDULED, nil
 	case callbackspb.CALLBACK_STATUS_BACKING_OFF:
 		return enumspb.CALLBACK_STATE_BACKING_OFF, nil
-	case callbackspb.CALLBACK_STATUS_FAILED:
+	case callbackspb.CALLBACK_STATUS_FAILED, callbackspb.CALLBACK_STATUS_CANCELED:
 		return enumspb.CALLBACK_STATE_FAILED, nil
 	case callbackspb.CALLBACK_STATUS_SUCCEEDED:
 		return enumspb.CALLBACK_STATE_SUCCEEDED, nil
@@ -329,7 +330,8 @@ func (c *Callback) ToAPICallbackInfo(ctx chasm.Context) (*callbackpb.CallbackInf
 // FromAPICallback converts an API callback into a CHASM callback proto.
 func FromAPICallback(cb *commonpb.Callback) (*callbackspb.Callback, error) {
 	res := &callbackspb.Callback{
-		Links: common.CloneProtoSlice(cb.GetLinks()),
+		Links:              common.CloneProtoSlice(cb.GetLinks()),
+		ResultSubscription: common.CloneProto(cb.GetResultSubscription()),
 	}
 
 	switch variant := cb.GetVariant().(type) {

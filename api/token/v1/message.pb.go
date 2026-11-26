@@ -668,6 +668,97 @@ func (x *NexusOperationCompletion) GetComponentRef() []byte {
 	return nil
 }
 
+// A token identifying an attached GetWorkflowExecutionResult subscription.
+type ResultSubscriptionToken struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Token format version; starts at 1.
+	Version int32 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	// Target namespace ID.
+	NamespaceId string `protobuf:"bytes,2,opt,name=namespace_id,json=namespaceId,proto3" json:"namespace_id,omitempty"`
+	// Target workflow ID.
+	WorkflowId string `protobuf:"bytes,3,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	// First execution run ID of the target workflow chain.
+	FirstRunId string `protobuf:"bytes,4,opt,name=first_run_id,json=firstRunId,proto3" json:"first_run_id,omitempty"`
+	// Target run ID resolved when the subscription was attached.
+	ResolvedRunId string `protobuf:"bytes,5,opt,name=resolved_run_id,json=resolvedRunId,proto3" json:"resolved_run_id,omitempty"`
+	// Caller's scheduled Nexus operation request ID.
+	RequestId     string `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResultSubscriptionToken) Reset() {
+	*x = ResultSubscriptionToken{}
+	mi := &file_temporal_server_api_token_v1_message_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResultSubscriptionToken) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResultSubscriptionToken) ProtoMessage() {}
+
+func (x *ResultSubscriptionToken) ProtoReflect() protoreflect.Message {
+	mi := &file_temporal_server_api_token_v1_message_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResultSubscriptionToken.ProtoReflect.Descriptor instead.
+func (*ResultSubscriptionToken) Descriptor() ([]byte, []int) {
+	return file_temporal_server_api_token_v1_message_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *ResultSubscriptionToken) GetVersion() int32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *ResultSubscriptionToken) GetNamespaceId() string {
+	if x != nil {
+		return x.NamespaceId
+	}
+	return ""
+}
+
+func (x *ResultSubscriptionToken) GetWorkflowId() string {
+	if x != nil {
+		return x.WorkflowId
+	}
+	return ""
+}
+
+func (x *ResultSubscriptionToken) GetFirstRunId() string {
+	if x != nil {
+		return x.FirstRunId
+	}
+	return ""
+}
+
+func (x *ResultSubscriptionToken) GetResolvedRunId() string {
+	if x != nil {
+		return x.ResolvedRunId
+	}
+	return ""
+}
+
+func (x *ResultSubscriptionToken) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
 var File_temporal_server_api_token_v1_message_proto protoreflect.FileDescriptor
 
 const file_temporal_server_api_token_v1_message_proto_rawDesc = "" +
@@ -738,7 +829,17 @@ const file_temporal_server_api_token_v1_message_proto_rawDesc = "" +
 	"\x03ref\x18\x04 \x01(\v23.temporal.server.api.persistence.v1.StateMachineRefR\x03ref\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x05 \x01(\tR\trequestId\x12#\n" +
-	"\rcomponent_ref\x18\x06 \x01(\fR\fcomponentRefB*Z(go.temporal.io/server/api/token/v1;tokenb\x06proto3"
+	"\rcomponent_ref\x18\x06 \x01(\fR\fcomponentRef\"\xe0\x01\n" +
+	"\x17ResultSubscriptionToken\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\x05R\aversion\x12!\n" +
+	"\fnamespace_id\x18\x02 \x01(\tR\vnamespaceId\x12\x1f\n" +
+	"\vworkflow_id\x18\x03 \x01(\tR\n" +
+	"workflowId\x12 \n" +
+	"\ffirst_run_id\x18\x04 \x01(\tR\n" +
+	"firstRunId\x12&\n" +
+	"\x0fresolved_run_id\x18\x05 \x01(\tR\rresolvedRunId\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x06 \x01(\tR\trequestIdB*Z(go.temporal.io/server/api/token/v1;tokenb\x06proto3"
 
 var (
 	file_temporal_server_api_token_v1_message_proto_rawDescOnce sync.Once
@@ -752,7 +853,7 @@ func file_temporal_server_api_token_v1_message_proto_rawDescGZIP() []byte {
 	return file_temporal_server_api_token_v1_message_proto_rawDescData
 }
 
-var file_temporal_server_api_token_v1_message_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_temporal_server_api_token_v1_message_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_temporal_server_api_token_v1_message_proto_goTypes = []any{
 	(*HistoryContinuation)(nil),      // 0: temporal.server.api.token.v1.HistoryContinuation
 	(*RawHistoryContinuation)(nil),   // 1: temporal.server.api.token.v1.RawHistoryContinuation
@@ -761,22 +862,23 @@ var file_temporal_server_api_token_v1_message_proto_goTypes = []any{
 	(*NexusTask)(nil),                // 4: temporal.server.api.token.v1.NexusTask
 	(*HistoryEventRef)(nil),          // 5: temporal.server.api.token.v1.HistoryEventRef
 	(*NexusOperationCompletion)(nil), // 6: temporal.server.api.token.v1.NexusOperationCompletion
-	(*v1.VersionHistoryItem)(nil),    // 7: temporal.server.api.history.v1.VersionHistoryItem
-	(*v11.VersionedTransition)(nil),  // 8: temporal.server.api.persistence.v1.VersionedTransition
-	(*v1.VersionHistories)(nil),      // 9: temporal.server.api.history.v1.VersionHistories
-	(*v12.VectorClock)(nil),          // 10: temporal.server.api.clock.v1.VectorClock
-	(*timestamppb.Timestamp)(nil),    // 11: google.protobuf.Timestamp
-	(v13.TaskQueueKind)(0),           // 12: temporal.api.enums.v1.TaskQueueKind
-	(*v11.StateMachineRef)(nil),      // 13: temporal.server.api.persistence.v1.StateMachineRef
+	(*ResultSubscriptionToken)(nil),  // 7: temporal.server.api.token.v1.ResultSubscriptionToken
+	(*v1.VersionHistoryItem)(nil),    // 8: temporal.server.api.history.v1.VersionHistoryItem
+	(*v11.VersionedTransition)(nil),  // 9: temporal.server.api.persistence.v1.VersionedTransition
+	(*v1.VersionHistories)(nil),      // 10: temporal.server.api.history.v1.VersionHistories
+	(*v12.VectorClock)(nil),          // 11: temporal.server.api.clock.v1.VectorClock
+	(*timestamppb.Timestamp)(nil),    // 12: google.protobuf.Timestamp
+	(v13.TaskQueueKind)(0),           // 13: temporal.api.enums.v1.TaskQueueKind
+	(*v11.StateMachineRef)(nil),      // 14: temporal.server.api.persistence.v1.StateMachineRef
 }
 var file_temporal_server_api_token_v1_message_proto_depIdxs = []int32{
-	7,  // 0: temporal.server.api.token.v1.HistoryContinuation.version_history_item:type_name -> temporal.server.api.history.v1.VersionHistoryItem
-	8,  // 1: temporal.server.api.token.v1.HistoryContinuation.versioned_transition:type_name -> temporal.server.api.persistence.v1.VersionedTransition
-	9,  // 2: temporal.server.api.token.v1.RawHistoryContinuation.version_histories:type_name -> temporal.server.api.history.v1.VersionHistories
-	10, // 3: temporal.server.api.token.v1.Task.clock:type_name -> temporal.server.api.clock.v1.VectorClock
-	11, // 4: temporal.server.api.token.v1.Task.started_time:type_name -> google.protobuf.Timestamp
-	12, // 5: temporal.server.api.token.v1.NexusTask.task_queue_kind:type_name -> temporal.api.enums.v1.TaskQueueKind
-	13, // 6: temporal.server.api.token.v1.NexusOperationCompletion.ref:type_name -> temporal.server.api.persistence.v1.StateMachineRef
+	8,  // 0: temporal.server.api.token.v1.HistoryContinuation.version_history_item:type_name -> temporal.server.api.history.v1.VersionHistoryItem
+	9,  // 1: temporal.server.api.token.v1.HistoryContinuation.versioned_transition:type_name -> temporal.server.api.persistence.v1.VersionedTransition
+	10, // 2: temporal.server.api.token.v1.RawHistoryContinuation.version_histories:type_name -> temporal.server.api.history.v1.VersionHistories
+	11, // 3: temporal.server.api.token.v1.Task.clock:type_name -> temporal.server.api.clock.v1.VectorClock
+	12, // 4: temporal.server.api.token.v1.Task.started_time:type_name -> google.protobuf.Timestamp
+	13, // 5: temporal.server.api.token.v1.NexusTask.task_queue_kind:type_name -> temporal.api.enums.v1.TaskQueueKind
+	14, // 6: temporal.server.api.token.v1.NexusOperationCompletion.ref:type_name -> temporal.server.api.persistence.v1.StateMachineRef
 	7,  // [7:7] is the sub-list for method output_type
 	7,  // [7:7] is the sub-list for method input_type
 	7,  // [7:7] is the sub-list for extension type_name
@@ -795,7 +897,7 @@ func file_temporal_server_api_token_v1_message_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_temporal_server_api_token_v1_message_proto_rawDesc), len(file_temporal_server_api_token_v1_message_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

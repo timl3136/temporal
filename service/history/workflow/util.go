@@ -13,6 +13,7 @@ import (
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
 	callbackspb "go.temporal.io/server/chasm/lib/callback/gen/callbackpb/v1"
+	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/effect"
 	"go.temporal.io/server/common/metrics"
@@ -297,6 +298,9 @@ func getCompletionCallbacksAsProtoSlice(ctx context.Context, ms historyi.Mutable
 		if _, ok := cb.Trigger.Variant.(*persistencespb.CallbackInfo_Trigger_WorkflowClosed); !ok {
 			continue
 		}
+		if cb.State() != enumsspb.CALLBACK_STATE_STANDBY {
+			continue
+		}
 		cbSpec, err := PersistenceCallbackToAPICallback(cb.Callback)
 		if err != nil {
 			return nil, err
@@ -332,7 +336,8 @@ func getCompletionCallbacksAsProtoSlice(ctx context.Context, ms historyi.Mutable
 
 func PersistenceCallbackToAPICallback(cb *persistencespb.Callback) (*commonpb.Callback, error) {
 	res := &commonpb.Callback{
-		Links: cb.GetLinks(),
+		Links:              cb.GetLinks(),
+		ResultSubscription: common.CloneProto(cb.GetResultSubscription()),
 	}
 	switch variant := cb.Variant.(type) {
 	case *persistencespb.Callback_Nexus_:

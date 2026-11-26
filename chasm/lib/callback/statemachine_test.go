@@ -181,3 +181,50 @@ func TestValidTransitions(t *testing.T) {
 	// Assert task is not generated, failed is terminal
 	require.Empty(t, mctx.Tasks)
 }
+
+func TestTransitionCanceled(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []callbackspb.CallbackStatus{
+		callbackspb.CALLBACK_STATUS_STANDBY,
+		callbackspb.CALLBACK_STATUS_SCHEDULED,
+		callbackspb.CALLBACK_STATUS_BACKING_OFF,
+	} {
+		t.Run("from_"+status.String(), func(t *testing.T) {
+			t.Parallel()
+			cb := &Callback{
+				CallbackState: &callbackspb.CallbackState{
+					Status: status,
+					Callback: &callbackspb.Callback{
+						Variant: &callbackspb.Callback_Nexus_{
+							Nexus: &callbackspb.Callback_Nexus{Url: "temporal://system"},
+						},
+					},
+				},
+			}
+			mctx := &chasm.MockMutableContext{}
+			require.True(t, TransitionCanceled.Possible(cb))
+			require.NoError(t, TransitionCanceled.Apply(cb, mctx, EventCanceled{}))
+			require.Equal(t, callbackspb.CALLBACK_STATUS_CANCELED, cb.StateMachineState())
+			require.Equal(t, chasm.LifecycleStateFailed, cb.LifecycleState(mctx))
+			require.Nil(t, cb.NextAttemptScheduleTime)
+			require.Empty(t, mctx.Tasks)
+		})
+	}
+
+	for _, status := range []callbackspb.CallbackStatus{
+		callbackspb.CALLBACK_STATUS_SUCCEEDED,
+		callbackspb.CALLBACK_STATUS_FAILED,
+		callbackspb.CALLBACK_STATUS_CANCELED,
+	} {
+		t.Run("rejected_from_"+status.String(), func(t *testing.T) {
+			t.Parallel()
+			cb := &Callback{
+				CallbackState: &callbackspb.CallbackState{Status: status},
+			}
+			mctx := &chasm.MockMutableContext{}
+			require.False(t, TransitionCanceled.Possible(cb))
+			require.ErrorIs(t, TransitionCanceled.Apply(cb, mctx, EventCanceled{}), chasm.ErrInvalidTransition)
+		})
+	}
+}

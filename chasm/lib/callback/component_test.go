@@ -146,6 +146,36 @@ func TestFromAPICallback(t *testing.T) {
 		require.ErrorAs(t, err, &internalErr)
 		require.ErrorContains(t, err, "unsupported CHASM callback type")
 	})
+
+	t.Run("ResultSubscriptionRoundTrippedAndCloned", func(t *testing.T) {
+		orig := &commonpb.Callback{
+			Variant: &commonpb.Callback_Nexus_{
+				Nexus: &commonpb.Callback_Nexus{
+					Url:    "temporal://system",
+					Header: map[string]string{"temporal-callback-token": "tok"},
+				},
+			},
+			ResultSubscription: &commonpb.Callback_ResultSubscription{
+				RequestId:           "sub-req-1",
+				ResultFormatVersion: 1,
+				ResolvedExecution: &commonpb.WorkflowExecution{
+					WorkflowId: "target-wf",
+					RunId:      "target-run",
+				},
+			},
+		}
+
+		persisted, err := FromAPICallback(orig)
+		require.NoError(t, err)
+		protorequire.ProtoEqual(t, orig.GetResultSubscription(), persisted.GetResultSubscription())
+		require.NotSame(t, orig.GetResultSubscription(), persisted.GetResultSubscription())
+
+		cb := &Callback{CallbackState: &callbackspb.CallbackState{Callback: persisted}}
+		roundTripped, err := cb.ToAPICallback()
+		require.NoError(t, err)
+		protorequire.ProtoEqual(t, orig, roundTripped)
+		require.NotSame(t, persisted.GetResultSubscription(), roundTripped.GetResultSubscription())
+	})
 }
 
 // A callback whose variant this server doesn't know how to invoke can still be persisted (by a server that
@@ -289,6 +319,11 @@ func TestAPIStateCircuitBreaker(t *testing.T) {
 		{
 			name:      "failed",
 			status:    callbackspb.CALLBACK_STATUS_FAILED,
+			wantState: enumspb.CALLBACK_STATE_FAILED,
+		},
+		{
+			name:      "canceled",
+			status:    callbackspb.CALLBACK_STATUS_CANCELED,
 			wantState: enumspb.CALLBACK_STATE_FAILED,
 		},
 	}

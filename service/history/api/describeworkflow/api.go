@@ -405,7 +405,7 @@ func buildCallbackInfoFromHSM(
 		state = enumspb.CALLBACK_STATE_SCHEDULED
 	case enumsspb.CALLBACK_STATE_BACKING_OFF:
 		state = enumspb.CALLBACK_STATE_BACKING_OFF
-	case enumsspb.CALLBACK_STATE_FAILED:
+	case enumsspb.CALLBACK_STATE_FAILED, enumsspb.CALLBACK_STATE_CANCELED:
 		state = enumspb.CALLBACK_STATE_FAILED
 	case enumsspb.CALLBACK_STATE_SUCCEEDED:
 		state = enumspb.CALLBACK_STATE_SUCCEEDED

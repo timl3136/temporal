@@ -886,6 +886,8 @@ message Callback {
   }
 
   repeated temporal.api.common.v1.Link links = 100;
+  // Server-authored metadata for a GetWorkflowExecutionResult subscription.
+  temporal.api.common.v1.Callback.ResultSubscription result_subscription = 101;
 }
 
 message HSMCompletionCallbackArg {

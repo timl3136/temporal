@@ -7,6 +7,7 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/chasm"
+	callbackspb "go.temporal.io/server/chasm/lib/callback/gen/callbackpb/v1"
 	chasmworkflowpb "go.temporal.io/server/chasm/lib/workflow/gen/workflowpb/v1"
 	"go.temporal.io/server/common/callbacks"
 	"go.temporal.io/server/common/namespace"
@@ -322,4 +323,68 @@ func TestValidateCallbackAddition_InFlight(t *testing.T) {
 			validatorWithMaxCount(t, 3),
 		))
 	})
+}
+
+func TestResultSubscriptionLookupAndCancel(t *testing.T) {
+	t.Parallel()
+
+	ctx := newTestCHASMContext(t)
+	wf := newTestWorkflow()
+
+	sub1 := &commonpb.Callback{
+		Variant: &commonpb.Callback_Nexus_{
+			Nexus: &commonpb.Callback_Nexus{Url: "temporal://system"},
+		},
+		ResultSubscription: &commonpb.Callback_ResultSubscription{
+			RequestId:           "sub-req-1",
+			ResultFormatVersion: 1,
+			ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "wf", RunId: "run-1"},
+		},
+	}
+	sub2 := &commonpb.Callback{
+		Variant: &commonpb.Callback_Nexus_{
+			Nexus: &commonpb.Callback_Nexus{Url: "temporal://system"},
+		},
+		ResultSubscription: &commonpb.Callback_ResultSubscription{
+			RequestId:           "sub-req-2",
+			ResultFormatVersion: 1,
+			ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "wf", RunId: "run-1"},
+		},
+	}
+	legacy := nexusCallback("http://legacy")
+
+	// Simulate sub1 inherited under a continue-as-new request ID (different map key than sub-req-1).
+	require.NoError(t, wf.AddCompletionCallbacks(ctx, timestamppb.Now(), "can-req-id", []*commonpb.Callback{sub1, legacy}))
+	require.NoError(t, wf.AddCompletionCallbacks(ctx, timestamppb.Now(), "sub-req-2", []*commonpb.Callback{sub2}))
+
+	initialCount := wf.GetCallbackMetadata().GetTotalCallbacksCount()
+	initialSize := wf.GetCallbackMetadata().GetTotalCallbacksSize()
+	require.Equal(t, int64(3), initialCount)
+
+	// FindResultSubscription resolves inherited subscription by ResultSubscription.RequestId.
+	key1, cb1, ok := wf.FindResultSubscription(ctx, "sub-req-1")
+	require.True(t, ok)
+	require.Equal(t, "can-req-id-0", key1)
+	require.Equal(t, "sub-req-1", cb1.GetCallback().GetResultSubscription().GetRequestId())
+
+	// Non-result callback is not returned even when querying by its attach request ID.
+	_, _, ok = wf.FindResultSubscription(ctx, "can-req-id")
+	require.False(t, ok)
+
+	// Cancel only sub-req-1; sub-req-2 and legacy stay in STANDBY, metadata totals remain unchanged.
+	cancelSet := map[string]struct{}{"sub-req-1": {}, "missing-req": {}}
+	keys := wf.CancelableResultSubscriptionKeys(ctx, cancelSet)
+	require.Equal(t, []string{key1}, keys)
+	require.NoError(t, wf.CancelResultSubscriptions(ctx, keys))
+
+	require.Equal(t, callbackspb.CALLBACK_STATUS_CANCELED, wf.Callbacks[key1].Get(ctx).Status)
+	_, cb2, ok := wf.FindResultSubscription(ctx, "sub-req-2")
+	require.True(t, ok)
+	require.Equal(t, callbackspb.CALLBACK_STATUS_STANDBY, cb2.Status)
+	require.Equal(t, callbackspb.CALLBACK_STATUS_STANDBY, wf.Callbacks["can-req-id-1"].Get(ctx).Status)
+	require.Equal(t, initialCount, wf.GetCallbackMetadata().GetTotalCallbacksCount())
+	require.Equal(t, initialSize, wf.GetCallbackMetadata().GetTotalCallbacksSize())
+
+	// Second lookup for cancelable keys is empty (idempotent).
+	require.Empty(t, wf.CancelableResultSubscriptionKeys(ctx, cancelSet))
 }

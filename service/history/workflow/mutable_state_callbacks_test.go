@@ -17,6 +17,7 @@ import (
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	"go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/chasm"
+	callbackspb "go.temporal.io/server/chasm/lib/callback/gen/callbackpb/v1"
 	chasmworkflow "go.temporal.io/server/chasm/lib/workflow"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/dynamicconfig"
@@ -356,4 +357,126 @@ func (s *mutableStateSuite) TestChasmUpdateCallbacks_InFlightReservedUntilAccept
 	// Were the Registry still to report it, the persisted copy is recognized and not recounted.
 	err = ms.ValidateCallbackAddition([]chasmworkflow.CallbackAddition{inFlight}, another)
 	s.ErrorContains(err, "(3 callbacks already attached)")
+}
+
+func (s *mutableStateSuite) TestResultSubscriptionCallbacks_CancelAndReplay() {
+	makeSubCB := func(subReqID, resolvedRunID string) *commonpb.Callback {
+		return &commonpb.Callback{
+			Variant: &commonpb.Callback_Nexus_{
+				Nexus: &commonpb.Callback_Nexus{Url: "temporal://system"},
+			},
+			ResultSubscription: &commonpb.Callback_ResultSubscription{
+				RequestId:           subReqID,
+				ResultFormatVersion: 1,
+				ResolvedExecution: &commonpb.WorkflowExecution{
+					WorkflowId: tests.WorkflowID,
+					RunId:      resolvedRunID,
+				},
+			},
+		}
+	}
+
+	s.Run("CHASM cancel, CAN inheritance, close, and replay under lowered limits", func() {
+		ms := s.enableChasmCallbacks(10)
+		_, completedEvent := s.startWithCompletionCallbacks(ms, 0)
+
+		attachEv1, err := ms.AddWorkflowExecutionOptionsUpdatedEvent(
+			nil, false, "sub-1", []*commonpb.Callback{makeSubCB("sub-1", tests.RunID)}, nil, "", nil, nil, false, nil,
+		)
+		s.Require().NoError(err)
+		attachEv2, err := ms.AddWorkflowExecutionOptionsUpdatedEvent(
+			nil, false, "sub-2", []*commonpb.Callback{makeSubCB("sub-2", tests.RunID)}, nil, "", nil, nil, false, nil,
+		)
+		s.Require().NoError(err)
+
+		// Continue-as-new copies both subscriptions with ResultSubscription intact under new map keys.
+		_, newRun, err := ms.AddContinueAsNewEvent(
+			s.T().Context(),
+			completedEvent.GetEventId(),
+			"",
+			&commandpb.ContinueAsNewWorkflowExecutionCommandAttributes{
+				WorkflowRunTimeout: ms.GetExecutionInfo().WorkflowRunTimeout,
+			},
+			nil,
+		)
+		s.Require().NoError(err)
+
+		// Cancel sub-1 on the new run via WorkflowExecutionOptionsUpdatedEvent.
+		cancelEv, err := newRun.AddWorkflowExecutionOptionsUpdatedEventWithAttributes(
+			&historypb.WorkflowExecutionOptionsUpdatedEventAttributes{
+				CanceledResultSubscriptionRequestIds: []string{"sub-1"},
+			},
+			nil,
+		)
+		s.Require().NoError(err)
+		s.True(cancelEv.GetWorkerMayIgnore())
+
+		wf, ctx, err := newRun.ChasmWorkflowComponentReadOnly(s.T().Context())
+		s.Require().NoError(err)
+		s.Equal(int64(2), wf.GetCallbackMetadata().GetTotalCallbacksCount())
+		_, cb1, ok := wf.FindResultSubscription(ctx, "sub-1")
+		s.Require().True(ok)
+		s.Equal(callbackspb.CALLBACK_STATUS_CANCELED, cb1.Status)
+		_, cb2, ok := wf.FindResultSubscription(ctx, "sub-2")
+		s.Require().True(ok)
+		s.Equal(callbackspb.CALLBACK_STATUS_STANDBY, cb2.Status)
+
+		// Replay both attach events and the cancel event on a fresh mutable state with lowered limits.
+		replayMS := s.enableChasmCallbacks(0)
+		s.lowerCallbackLimits()
+		s.Require().NoError(replayMS.ApplyWorkflowExecutionOptionsUpdatedEvent(attachEv1))
+		s.Require().NoError(replayMS.ApplyWorkflowExecutionOptionsUpdatedEvent(attachEv2))
+		s.Require().NoError(replayMS.ApplyWorkflowExecutionOptionsUpdatedEvent(cancelEv))
+
+		replayWF, replayCtx, err := replayMS.ChasmWorkflowComponentReadOnly(s.T().Context())
+		s.Require().NoError(err)
+		_, rcb1, ok := replayWF.FindResultSubscription(replayCtx, "sub-1")
+		s.Require().True(ok)
+		s.Equal(callbackspb.CALLBACK_STATUS_CANCELED, rcb1.Status)
+		_, rcb2, ok := replayWF.FindResultSubscription(replayCtx, "sub-2")
+		s.Require().True(ok)
+		s.Equal(callbackspb.CALLBACK_STATUS_STANDBY, rcb2.Status)
+	})
+
+	s.Run("HSM cancel preserves other waiter and does not fail workflow close", func() {
+		ms := s.enableChasmCallbacks(10)
+		s.mockConfig.EnableCHASMCallbacks = dynamicconfig.GetBoolPropertyFnFilteredByNamespace(false)
+		_, completedEvent := s.startWithCompletionCallbacks(ms, 0)
+
+		_, err := ms.AddWorkflowExecutionOptionsUpdatedEvent(
+			nil, false, "sub-1", []*commonpb.Callback{makeSubCB("sub-1", tests.RunID)}, nil, "", nil, nil, false, nil,
+		)
+		s.Require().NoError(err)
+		_, err = ms.AddWorkflowExecutionOptionsUpdatedEvent(
+			nil, false, "sub-2", []*commonpb.Callback{makeSubCB("sub-2", tests.RunID)}, nil, "", nil, nil, false, nil,
+		)
+		s.Require().NoError(err)
+
+		_, err = ms.AddWorkflowExecutionOptionsUpdatedEventWithAttributes(
+			&historypb.WorkflowExecutionOptionsUpdatedEventAttributes{
+				CanceledResultSubscriptionRequestIds: []string{"sub-1"},
+			},
+			nil,
+		)
+		s.Require().NoError(err)
+
+		coll := callbacks.MachineCollection(ms.HSM())
+		cb1, err := coll.Data("cb-sub-1-0")
+		s.Require().NoError(err)
+		s.Equal(enumsspb.CALLBACK_STATE_CANCELED, cb1.State())
+		cb2, err := coll.Data("cb-sub-2-0")
+		s.Require().NoError(err)
+		s.Equal(enumsspb.CALLBACK_STATE_STANDBY, cb2.State())
+
+		// Closing the workflow must succeed, keeping sub-1 CANCELED and scheduling sub-2.
+		_, err = ms.AddCompletedWorkflowEvent(completedEvent.GetEventId(), &commandpb.CompleteWorkflowExecutionCommandAttributes{}, "")
+		s.Require().NoError(err)
+
+		cb1, err = coll.Data("cb-sub-1-0")
+		s.Require().NoError(err)
+		s.Equal(enumsspb.CALLBACK_STATE_CANCELED, cb1.State())
+		cb2, err = coll.Data("cb-sub-2-0")
+		s.Require().NoError(err)
+		s.Equal(enumsspb.CALLBACK_STATE_SCHEDULED, cb2.State())
+	})
 }
