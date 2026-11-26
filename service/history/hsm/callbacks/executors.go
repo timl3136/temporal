@@ -108,6 +108,19 @@ type callbackInvokable interface {
 	WrapError(result invocationResult, err error) error
 }
 
+// failInvocation transitions the callback to FAILED without making an outbound call.
+type failInvocation struct {
+	err error
+}
+
+func (f failInvocation) Invoke(context.Context, *namespace.Namespace, taskExecutor, InvocationTask) invocationResult {
+	return invocationResultFail(f)
+}
+
+func (failInvocation) WrapError(_ invocationResult, err error) error {
+	return err
+}
+
 func (e taskExecutor) executeInvocationTask(
 	ctx context.Context,
 	env hsm.Environment,
@@ -167,7 +180,8 @@ func (e taskExecutor) loadInvocationArgs(
 			}
 			completion, err = resultTarget.GetResultSubscriptionCompletion(ctx, callback.GetRequestId(), sub)
 			if errors.Is(err, commoncallbacks.ErrResultSubscriptionNonTerminalClose) {
-				return fmt.Errorf("%w: %w", queueserrors.NewUnprocessableTaskError("result subscription close event has a successor"), err)
+				invokable = failInvocation{err: err}
+				return nil
 			}
 			if err != nil {
 				return err

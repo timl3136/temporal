@@ -775,55 +775,71 @@ func TestExecuteInvocationTask_ResultSubscription_NonTerminalCloseIsPermanent(t 
 		ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "workflow-id", RunId: "origin-run"},
 	}
 
-	for _, tc := range []struct {
-		name              string
-		subErr            error
-		wantUnprocessable bool
-	}{
-		{
-			name:              "successor close event becomes permanent unprocessable error",
-			subErr:            commoncallbacks.ErrResultSubscriptionNonTerminalClose,
-			wantUnprocessable: true,
-		},
-		{
-			name:              "transient read error stays retryable",
-			subErr:            serviceerror.NewUnavailable("persistence unavailable"),
-			wantUnprocessable: false,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			ns := test.NewNamespace(t)
-			handler := newTestInvocationHandler(t, ns, log.NewTestLogger(), nil, nil)
-			cb := &Callback{
-				CallbackState: &callbackspb.CallbackState{
-					RequestId: "attach-req-1",
-					Callback: &callbackspb.Callback{
-						Variant: &callbackspb.Callback_Nexus_{
-							Nexus: &callbackspb.Callback_Nexus{Url: commonnexus.SystemCallbackURL},
-						},
-						ResultSubscription: subMeta,
+	newCB := func() *Callback {
+		return &Callback{
+			CallbackState: &callbackspb.CallbackState{
+				RequestId: "attach-req-1",
+				Callback: &callbackspb.Callback{
+					Variant: &callbackspb.Callback_Nexus_{
+						Nexus: &callbackspb.Callback_Nexus{Url: commonnexus.SystemCallbackURL},
 					},
-					Status: callbackspb.CALLBACK_STATUS_SCHEDULED,
+					ResultSubscription: subMeta,
 				},
-			}
-			engineCtx, refs := newDualCompletionTaskTest(t, handler, &mockDualCompletionSource{subErr: tc.subErr}, map[string]*Callback{"sub": cb})
-			err := handler.Execute(
-				engineCtx,
-				refs["sub"],
-				chasm.TaskAttributes{Destination: commonnexus.SystemCallbackURL},
-				&callbackspb.InvocationTask{Attempt: 0},
-			)
-			require.ErrorIs(t, err, tc.subErr)
-			var unprocessableErr *queueserrors.UnprocessableTaskError
-			if tc.wantUnprocessable {
-				require.ErrorAs(t, err, &unprocessableErr)
-			} else {
-				require.NotErrorAs(t, err, &unprocessableErr)
-			}
-		})
+				Status: callbackspb.CALLBACK_STATUS_SCHEDULED,
+			},
+		}
 	}
+
+	t.Run("successor close event fails callback permanently", func(t *testing.T) {
+		t.Parallel()
+
+		ns := test.NewNamespace(t)
+		handler := newTestInvocationHandler(t, ns, log.NewTestLogger(), nil, nil)
+		engineCtx, refs := newDualCompletionTaskTest(
+			t,
+			handler,
+			&mockDualCompletionSource{subErr: commoncallbacks.ErrResultSubscriptionNonTerminalClose},
+			map[string]*Callback{"sub": newCB()},
+		)
+		err := handler.Execute(
+			engineCtx,
+			refs["sub"],
+			chasm.TaskAttributes{Destination: commonnexus.SystemCallbackURL},
+			&callbackspb.InvocationTask{Attempt: 0},
+		)
+		require.NoError(t, err)
+		readCallbackState(engineCtx, t, refs["sub"], func(_ chasm.Context, got *Callback) {
+			require.Equal(t, callbackspb.CALLBACK_STATUS_FAILED, got.Status)
+			require.Contains(t, got.GetLastAttemptFailure().GetMessage(), commoncallbacks.ErrResultSubscriptionNonTerminalClose.Error())
+			require.True(t, got.GetLastAttemptFailure().GetApplicationFailureInfo().GetNonRetryable())
+		})
+	})
+
+	t.Run("transient read error stays retryable", func(t *testing.T) {
+		t.Parallel()
+
+		transientErr := serviceerror.NewUnavailable("persistence unavailable")
+		ns := test.NewNamespace(t)
+		handler := newTestInvocationHandler(t, ns, log.NewTestLogger(), nil, nil)
+		engineCtx, refs := newDualCompletionTaskTest(
+			t,
+			handler,
+			&mockDualCompletionSource{subErr: transientErr},
+			map[string]*Callback{"sub": newCB()},
+		)
+		err := handler.Execute(
+			engineCtx,
+			refs["sub"],
+			chasm.TaskAttributes{Destination: commonnexus.SystemCallbackURL},
+			&callbackspb.InvocationTask{Attempt: 0},
+		)
+		require.ErrorIs(t, err, transientErr)
+		var unprocessableErr *queueserrors.UnprocessableTaskError
+		require.NotErrorAs(t, err, &unprocessableErr)
+		readCallbackState(engineCtx, t, refs["sub"], func(_ chasm.Context, got *Callback) {
+			require.Equal(t, callbackspb.CALLBACK_STATUS_SCHEDULED, got.Status)
+		})
+	})
 }
 
 type completionHandlerFunc func(context.Context, *nexusrpc.CompletionRequest) error

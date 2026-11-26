@@ -685,47 +685,59 @@ func TestProcessInvocationTask_ResultSubscription_NonTerminalCloseIsPermanent(t 
 		ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "workflow-id", RunId: "origin-run"},
 	}
 
-	for _, tc := range []struct {
-		name              string
-		subErr            error
-		wantUnprocessable bool
-	}{
-		{
-			name:              "successor close event becomes permanent unprocessable error",
-			subErr:            commoncallbacks.ErrResultSubscriptionNonTerminalClose,
-			wantUnprocessable: true,
-		},
-		{
-			name:              "transient read error stays retryable",
-			subErr:            serviceerror.NewUnavailable("persistence unavailable"),
-			wantUnprocessable: false,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			cb := callbacks.Callback{
-				CallbackInfo: &persistencespb.CallbackInfo{
-					Callback: &persistencespb.Callback{
-						Variant: &persistencespb.Callback_Nexus_{
-							Nexus: &persistencespb.Callback_Nexus{Url: commonnexus.SystemCallbackURL},
-						},
-						ResultSubscription: subMeta,
+	newCB := func() callbacks.Callback {
+		return callbacks.Callback{
+			CallbackInfo: &persistencespb.CallbackInfo{
+				Callback: &persistencespb.Callback{
+					Variant: &persistencespb.Callback_Nexus_{
+						Nexus: &persistencespb.Callback_Nexus{Url: commonnexus.SystemCallbackURL},
 					},
-					State:     enumsspb.CALLBACK_STATE_SCHEDULED,
-					RequestId: "attach-req-1",
+					ResultSubscription: subMeta,
 				},
-			}
-			_, err := executeHSMCallbackTask(t, &dualMutableState{subErr: tc.subErr}, "sub", cb, commonnexus.SystemCallbackURL, nil, nil, log.NewTestLogger())
-			require.ErrorIs(t, err, tc.subErr)
-			var unprocessableErr *queueserrors.UnprocessableTaskError
-			if tc.wantUnprocessable {
-				require.ErrorAs(t, err, &unprocessableErr)
-			} else {
-				require.NotErrorAs(t, err, &unprocessableErr)
-			}
-		})
+				State:     enumsspb.CALLBACK_STATE_SCHEDULED,
+				RequestId: "attach-req-1",
+			},
+		}
 	}
+
+	t.Run("successor close event fails callback permanently", func(t *testing.T) {
+		t.Parallel()
+
+		updated, err := executeHSMCallbackTask(
+			t,
+			&dualMutableState{subErr: commoncallbacks.ErrResultSubscriptionNonTerminalClose},
+			"sub",
+			newCB(),
+			commonnexus.SystemCallbackURL,
+			nil,
+			nil,
+			log.NewTestLogger(),
+		)
+		require.NoError(t, err)
+		require.Equal(t, enumsspb.CALLBACK_STATE_FAILED, updated.State())
+		require.Contains(t, updated.GetLastAttemptFailure().GetMessage(), commoncallbacks.ErrResultSubscriptionNonTerminalClose.Error())
+		require.True(t, updated.GetLastAttemptFailure().GetApplicationFailureInfo().GetNonRetryable())
+	})
+
+	t.Run("transient read error stays retryable", func(t *testing.T) {
+		t.Parallel()
+
+		transientErr := serviceerror.NewUnavailable("persistence unavailable")
+		updated, err := executeHSMCallbackTask(
+			t,
+			&dualMutableState{subErr: transientErr},
+			"sub",
+			newCB(),
+			commonnexus.SystemCallbackURL,
+			nil,
+			nil,
+			log.NewTestLogger(),
+		)
+		require.ErrorIs(t, err, transientErr)
+		var unprocessableErr *queueserrors.UnprocessableTaskError
+		require.NotErrorAs(t, err, &unprocessableErr)
+		require.Equal(t, enumsspb.CALLBACK_STATE_SCHEDULED, updated.State())
+	})
 }
 
 type hsmCompletionHandlerFunc func(context.Context, *nexusrpc.CompletionRequest) error

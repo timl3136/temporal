@@ -79,6 +79,19 @@ type invocable interface {
 	WrapError(result invocationResult, err error) error
 }
 
+// invocableFail transitions the callback to FAILED without making an outbound call.
+type invocableFail struct {
+	err error
+}
+
+func (f invocableFail) Invoke(context.Context, *namespace.Namespace, *invocationTaskHandler, *callbackspb.InvocationTask, chasm.TaskAttributes) invocationResult {
+	return invocationResultFail(f)
+}
+
+func (invocableFail) WrapError(_ invocationResult, err error) error {
+	return err
+}
+
 type invocationTaskHandlerOptions struct {
 	fx.In
 

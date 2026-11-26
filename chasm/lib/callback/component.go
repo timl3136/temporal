@@ -135,7 +135,7 @@ func (c *Callback) loadInvocationArgs(
 		}
 		completion, err = resultSource.GetResultSubscriptionCompletion(ctx, c.RequestId, sub)
 		if errors.Is(err, commoncallbacks.ErrResultSubscriptionNonTerminalClose) {
-			return nil, fmt.Errorf("%w: %w", queueserrors.NewUnprocessableTaskError("result subscription close event has a successor"), err)
+			return invocableFail{err: err}, nil
 		}
 	} else {
 		completion, err = target.GetNexusCompletion(ctx, c.RequestId)
