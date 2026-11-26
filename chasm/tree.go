@@ -247,6 +247,11 @@ type (
 			ctx context.Context,
 			requestID string,
 		) (nexusrpc.CompleteOperationOptions, error)
+		GetResultSubscriptionCompletion(
+			ctx context.Context,
+			requestID string,
+			sub *commonpb.Callback_ResultSubscription,
+		) (nexusrpc.CompleteOperationOptions, error)
 		GetNexusUpdateCompletion(
 			ctx context.Context,
 			updateID string,

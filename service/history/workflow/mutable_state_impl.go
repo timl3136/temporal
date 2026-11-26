@@ -911,18 +911,9 @@ func nexusCompleteOperationFailure(
 	}, nil
 }
 
-// GetNexusCompletion converts a workflow completion event into a [nexus.OperationCompletion].
-// Completions may be sent to arbitrary third parties, we intentionally do not include any termination reasons, and
-// expose only failure messages.
-func (ms *MutableStateImpl) GetNexusCompletion(
-	ctx context.Context,
-	requestID string,
-) (nexusrpc.CompleteOperationOptions, error) {
-	ce, err := ms.GetCompletionEvent(ctx)
-	if err != nil {
-		return nexusrpc.CompleteOperationOptions{}, err
-	}
+const resultSubscriptionFormatVersionV1 int32 = 1
 
+func (ms *MutableStateImpl) nexusCompletionLink(requestID string) nexus.Link {
 	// Create the link information about the workflow to be attached to fabricated started event if completion is
 	// received before start response.
 	link := &commonpb.Link_WorkflowEvent{
@@ -950,11 +941,87 @@ func (ms *MutableStateImpl) GetNexusCompletion(
 			},
 		}
 	}
-	startLink := commonnexus.ConvertLinkWorkflowEventToNexusLink(link)
+	return commonnexus.ConvertLinkWorkflowEventToNexusLink(link)
+}
+
+func (ms *MutableStateImpl) resultSubscriptionCompletionLink(
+	requestID string,
+	sub *commonpb.Callback_ResultSubscription,
+) nexus.Link {
+	if resolved := sub.GetResolvedExecution(); sub.GetRequestId() != "" &&
+		resolved.GetWorkflowId() != "" &&
+		resolved.GetRunId() != "" {
+		return commonnexus.ConvertLinkWorkflowEventToNexusLink(&commonpb.Link_WorkflowEvent{
+			Namespace:  ms.namespaceEntry.Name().String(),
+			WorkflowId: resolved.GetWorkflowId(),
+			RunId:      resolved.GetRunId(),
+			Reference: &commonpb.Link_WorkflowEvent_RequestIdRef{
+				RequestIdRef: &commonpb.Link_WorkflowEvent_RequestIdReference{
+					RequestId: sub.GetRequestId(),
+					EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+				},
+			},
+		})
+	}
+	return ms.nexusCompletionLink(requestID)
+}
+
+// GetResultSubscriptionCompletion converts a workflow close event into a same-namespace Nexus
+// completion for a server-authored GetWorkflowExecutionResult subscription.
+func (ms *MutableStateImpl) GetResultSubscriptionCompletion(
+	ctx context.Context,
+	requestID string,
+	sub *commonpb.Callback_ResultSubscription,
+) (nexusrpc.CompleteOperationOptions, error) {
+	if sub == nil || sub.GetResultFormatVersion() != resultSubscriptionFormatVersionV1 {
+		return nexusrpc.CompleteOperationOptions{}, serviceerror.NewInternalf(
+			"unsupported result subscription format version: %d",
+			sub.GetResultFormatVersion(),
+		)
+	}
+	if sub.GetRequestId() == "" {
+		return nexusrpc.CompleteOperationOptions{}, serviceerror.NewInternal("result subscription missing request ID")
+	}
+
+	ce, err := ms.GetCompletionEvent(ctx)
+	if err != nil {
+		return nexusrpc.CompleteOperationOptions{}, err
+	}
+
+	limit := ms.config.BlobSizeLimitError(ms.namespaceEntry.Name().String())
+	result, opErr, err := workflowResultFromCloseEvent(ce, limit)
+	if err != nil {
+		return nexusrpc.CompleteOperationOptions{}, err
+	}
+
+	opts := nexusrpc.CompleteOperationOptions{
+		StartTime: ms.executionState.GetStartTime().AsTime(),
+		CloseTime: ce.GetEventTime().AsTime(),
+		Links:     []nexus.Link{ms.resultSubscriptionCompletionLink(requestID, sub)},
+	}
+	if opErr != nil {
+		opts.Error = opErr
+	} else if result != nil {
+		opts.Result = result
+	}
+	return opts, nil
+}
+
+// GetNexusCompletion converts a workflow completion event into a [nexus.OperationCompletion].
+// Completions may be sent to arbitrary third parties, we intentionally do not include any termination reasons, and
+// expose only failure messages.
+func (ms *MutableStateImpl) GetNexusCompletion(
+	ctx context.Context,
+	requestID string,
+) (nexusrpc.CompleteOperationOptions, error) {
+	ce, err := ms.GetCompletionEvent(ctx)
+	if err != nil {
+		return nexusrpc.CompleteOperationOptions{}, err
+	}
 
 	startTime := ms.executionState.GetStartTime().AsTime()
 	closeTime := ce.GetEventTime().AsTime()
-	links := []nexus.Link{startLink}
+	links := []nexus.Link{ms.nexusCompletionLink(requestID)}
 
 	switch ce.GetEventType() {
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED:

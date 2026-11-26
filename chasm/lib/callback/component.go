@@ -1,6 +1,7 @@
 package callback
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"maps"
@@ -24,12 +25,24 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+const resultSubscriptionFormatVersionV1 int32 = 1
+
 // CompletionSource is the interface different kinds of executions implement so that their result can be
 // delivered to waiting callback handlers.
 type CompletionSource interface {
 	// GetNexusCompletion returns the execution's result. Links on the returned CompleteOperationOptions
 	// are the "backlinks", so a Nexus handler receiving the completion can link to its source.
 	GetNexusCompletion(ctx chasm.Context, requestID string) (nexusrpc.CompleteOperationOptions, error)
+}
+
+// ResultSubscriptionCompletionSource is implemented by completion sources that format same-namespace
+// GetWorkflowExecutionResult subscription deliveries.
+type ResultSubscriptionCompletionSource interface {
+	GetResultSubscriptionCompletion(
+		ctx chasm.Context,
+		requestID string,
+		sub *commonpb.Callback_ResultSubscription,
+	) (nexusrpc.CompleteOperationOptions, error)
 }
 
 var _ chasm.Component = (*Callback)(nil)
@@ -102,7 +115,23 @@ func (c *Callback) loadInvocationArgs(
 
 	// Get the parent CHASM object's Nexus result to be delivered.
 	target := c.CompletionSource.Get(ctx)
-	completion, err := target.GetNexusCompletion(ctx, c.RequestId)
+	sub := c.GetCallback().GetResultSubscription()
+	var completion nexusrpc.CompleteOperationOptions
+	var err error
+	if sub != nil {
+		if err := validateResultSubscriptionForDelivery(c.GetCallback(), sub); err != nil {
+			return nil, err
+		}
+		resultSource, ok := target.(ResultSubscriptionCompletionSource)
+		if !ok {
+			return nil, queueserrors.NewUnprocessableTaskError(
+				fmt.Sprintf("completion source %T does not support result subscriptions", target),
+			)
+		}
+		completion, err = resultSource.GetResultSubscriptionCompletion(ctx, c.RequestId, sub)
+	} else {
+		completion, err = target.GetNexusCompletion(ctx, c.RequestId)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -146,12 +175,13 @@ func (c *Callback) loadInvocationArgs(
 
 	// Nexus callbacks deliver results by also invoking a Nexus handler, but using HTTP.
 	callback := c.GetCallback().GetNexus()
+	deliveryRequestID := cmp.Or(sub.GetRequestId(), c.RequestId)
 	if callback.GetUrl() == chasm.NexusCompletionHandlerURL {
 		return invocableInternal{
 			callback:   callback,
 			attempt:    c.Attempt,
 			completion: completion,
-			requestID:  c.RequestId,
+			requestID:  deliveryRequestID,
 		}, nil
 	}
 	return invocableOutbound{
@@ -160,9 +190,35 @@ func (c *Callback) loadInvocationArgs(
 		completionSourceTag: c.CompletionSource.Fqn(),
 		businessID:          ctx.ExecutionKey().BusinessID,
 		runID:               ctx.ExecutionKey().RunID,
-		requestID:           c.RequestId,
+		requestID:           deliveryRequestID,
 		attempt:             c.Attempt,
 	}, nil
+}
+
+func validateResultSubscriptionForDelivery(
+	cb *callbackspb.Callback,
+	sub *commonpb.Callback_ResultSubscription,
+) error {
+	if sub.GetResultFormatVersion() != resultSubscriptionFormatVersionV1 {
+		return queueserrors.NewUnprocessableTaskError(
+			fmt.Sprintf("unsupported result subscription format version: %d", sub.GetResultFormatVersion()),
+		)
+	}
+	if sub.GetRequestId() == "" {
+		return queueserrors.NewUnprocessableTaskError("result subscription callback missing request ID")
+	}
+	nexusCB := cb.GetNexus()
+	if nexusCB == nil {
+		return queueserrors.NewUnprocessableTaskError(
+			fmt.Sprintf("unsupported callback variant for result subscription: %T", cb.GetVariant()),
+		)
+	}
+	if nexusCB.GetUrl() != commonnexus.SystemCallbackURL && nexusCB.GetUrl() != chasm.NexusCompletionHandlerURL {
+		return queueserrors.NewUnprocessableTaskError(
+			fmt.Sprintf("unsupported callback URL for result subscription: %q", nexusCB.GetUrl()),
+		)
+	}
+	return nil
 }
 
 // recordHandlerLinks stores the links the callback's target returned when it accepted the delivery.

@@ -322,6 +322,15 @@ func (b *readOnlyNodeBackend) GetNexusCompletion(
 	return nexusrpc.CompleteOperationOptions{}, nil
 }
 
+func (b *readOnlyNodeBackend) GetResultSubscriptionCompletion(
+	context.Context,
+	string,
+	*commonpb.Callback_ResultSubscription,
+) (nexusrpc.CompleteOperationOptions, error) {
+	b.unsupported("GetResultSubscriptionCompletion")
+	return nexusrpc.CompleteOperationOptions{}, nil
+}
+
 func (b *readOnlyNodeBackend) GetNexusUpdateCompletion(
 	context.Context,
 	string,

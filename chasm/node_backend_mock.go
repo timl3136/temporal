@@ -35,6 +35,7 @@ type MockNodeBackend struct {
 	HandleUpdateWorkflowStateStatus           func(state enumsspb.WorkflowExecutionState, status enumspb.WorkflowExecutionStatus) (bool, error)
 	HandleIsWorkflow                          func() bool
 	HandleGetNexusCompletion                  func(ctx context.Context, requestID string) (nexusrpc.CompleteOperationOptions, error)
+	HandleGetResultSubscriptionCompletion     func(ctx context.Context, requestID string, sub *commonpb.Callback_ResultSubscription) (nexusrpc.CompleteOperationOptions, error)
 	HandleGetNexusUpdateCompletion            func(ctx context.Context, updateID string, requestID string) (nexusrpc.CompleteOperationOptions, error)
 	HandleAddHistoryEvent                     func(t enumspb.EventType, setAttributes func(*historypb.HistoryEvent)) *historypb.HistoryEvent
 	HandleLoadHistoryEvent                    func(ctx context.Context, token []byte) (*historypb.HistoryEvent, error)
@@ -231,6 +232,17 @@ func (m *MockNodeBackend) GetNexusCompletion(
 ) (nexusrpc.CompleteOperationOptions, error) {
 	if m.HandleGetNexusCompletion != nil {
 		return m.HandleGetNexusCompletion(ctx, requestID)
+	}
+	return nexusrpc.CompleteOperationOptions{}, nil
+}
+
+func (m *MockNodeBackend) GetResultSubscriptionCompletion(
+	ctx context.Context,
+	requestID string,
+	sub *commonpb.Callback_ResultSubscription,
+) (nexusrpc.CompleteOperationOptions, error) {
+	if m.HandleGetResultSubscriptionCompletion != nil {
+		return m.HandleGetResultSubscriptionCompletion(ctx, requestID, sub)
 	}
 	return nexusrpc.CompleteOperationOptions{}, nil
 }

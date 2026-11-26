@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
+	commonpb "go.temporal.io/api/common/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/log"
@@ -27,6 +28,14 @@ var retryable4xxErrorTypes = []int{
 
 type CanGetNexusCompletion interface {
 	GetNexusCompletion(ctx context.Context, requestID string) (nexusrpc.CompleteOperationOptions, error)
+}
+
+type CanGetResultSubscriptionCompletion interface {
+	GetResultSubscriptionCompletion(
+		ctx context.Context,
+		requestID string,
+		sub *commonpb.Callback_ResultSubscription,
+	) (nexusrpc.CompleteOperationOptions, error)
 }
 
 type nexusInvocation struct {

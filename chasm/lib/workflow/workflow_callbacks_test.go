@@ -1,17 +1,21 @@
 package workflow
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/chasm"
+	"go.temporal.io/server/chasm/lib/callback"
 	callbackspb "go.temporal.io/server/chasm/lib/callback/gen/callbackpb/v1"
 	chasmworkflowpb "go.temporal.io/server/chasm/lib/workflow/gen/workflowpb/v1"
 	"go.temporal.io/server/common/callbacks"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/nexus/nexusrpc"
 	test "go.temporal.io/server/common/testing"
+	"go.temporal.io/server/common/testing/protorequire"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -387,4 +391,62 @@ func TestResultSubscriptionLookupAndCancel(t *testing.T) {
 
 	// Second lookup for cancelable keys is empty (idempotent).
 	require.Empty(t, wf.CancelableResultSubscriptionKeys(ctx, cancelSet))
+}
+
+func TestWorkflowResultSubscriptionCompletionSource(t *testing.T) {
+	t.Parallel()
+
+	wantSub := &commonpb.Callback_ResultSubscription{
+		RequestId:           "sub-req-1",
+		ResultFormatVersion: 1,
+		ResolvedExecution:   &commonpb.WorkflowExecution{WorkflowId: "wf", RunId: "run-1"},
+	}
+	subPayload := &commonpb.Payload{
+		Metadata: map[string][]byte{"encoding": []byte("binary/encrypted")},
+		Data:     []byte{0xff, 0x00, 0x80},
+	}
+	legacyPayload := &commonpb.Payload{
+		Metadata: map[string][]byte{"encoding": []byte("json/plain")},
+		Data:     []byte(`"legacy"`),
+	}
+
+	var gotSubReqID string
+	var gotSub *commonpb.Callback_ResultSubscription
+	var gotLegacyReqID string
+	backend := &chasm.MockNodeBackend{
+		HandleGetResultSubscriptionCompletion: func(_ context.Context, requestID string, sub *commonpb.Callback_ResultSubscription) (nexusrpc.CompleteOperationOptions, error) {
+			gotSubReqID = requestID
+			gotSub = sub
+			return nexusrpc.CompleteOperationOptions{Result: subPayload}, nil
+		},
+		HandleGetNexusCompletion: func(_ context.Context, requestID string) (nexusrpc.CompleteOperationOptions, error) {
+			gotLegacyReqID = requestID
+			return nexusrpc.CompleteOperationOptions{Result: legacyPayload}, nil
+		},
+	}
+	wf := &Workflow{
+		WorkflowState: &chasmworkflowpb.WorkflowState{},
+		MSPointer:     chasm.NewMSPointer(backend),
+	}
+	ctx := newTestCHASMContext(t)
+
+	subComp, err := wf.GetResultSubscriptionCompletion(ctx, "can-req-1", wantSub)
+	require.NoError(t, err)
+	require.Equal(t, "can-req-1", gotSubReqID)
+	protorequire.ProtoEqual(t, wantSub, gotSub)
+	protorequire.ProtoEqual(t, subPayload, subComp.Result.(*commonpb.Payload))
+
+	legacyComp, err := wf.GetNexusCompletion(ctx, "legacy-req-1")
+	require.NoError(t, err)
+	require.Equal(t, "legacy-req-1", gotLegacyReqID)
+	protorequire.ProtoEqual(t, legacyPayload, legacyComp.Result.(*commonpb.Payload))
+
+	// Update callbacks must never implement the workflow result subscription completion source.
+	var updateSource callback.CompletionSource = &WorkflowUpdate{}
+	_, ok := updateSource.(callback.ResultSubscriptionCompletionSource)
+	require.False(t, ok)
+
+	var updateHost callback.CompletionSource = updateCallbackHost{}
+	_, ok = updateHost.(callback.ResultSubscriptionCompletionSource)
+	require.False(t, ok)
 }

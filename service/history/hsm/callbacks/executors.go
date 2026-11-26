@@ -1,22 +1,28 @@
 package callbacks
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net/http"
 
+	commonpb "go.temporal.io/api/common/v1"
+	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
 	commonnexus "go.temporal.io/server/common/nexus"
+	"go.temporal.io/server/common/nexus/nexusrpc"
 	"go.temporal.io/server/common/resource"
 	"go.temporal.io/server/service/history/hsm"
 	queuescommon "go.temporal.io/server/service/history/queues/common"
 	queueserrors "go.temporal.io/server/service/history/queues/errors"
 	"go.uber.org/fx"
 )
+
+const resultSubscriptionFormatVersionV1 int32 = 1
 
 // HTTPCaller is a method that can be used to invoke HTTP requests.
 type HTTPCaller func(*http.Request) (*http.Response, error)
@@ -148,15 +154,35 @@ func (e taskExecutor) loadInvocationArgs(
 				fmt.Sprintf("unprocessable callback variant: %v", variant),
 			)
 		}
-		target, err := hsm.MachineData[CanGetNexusCompletion](node.Parent)
-		if err != nil {
-			return err
+
+		sub := callback.GetCallback().GetResultSubscription()
+		var completion nexusrpc.CompleteOperationOptions
+		if sub != nil {
+			if err := validateResultSubscriptionForDelivery(variant, sub); err != nil {
+				return err
+			}
+			resultTarget, err := hsm.MachineData[CanGetResultSubscriptionCompletion](node.Parent)
+			if err != nil {
+				return queueserrors.NewUnprocessableTaskError(
+					fmt.Sprintf("completion source does not support result subscriptions: %v", err),
+				)
+			}
+			completion, err = resultTarget.GetResultSubscriptionCompletion(ctx, callback.GetRequestId(), sub)
+			if err != nil {
+				return err
+			}
+		} else {
+			target, err := hsm.MachineData[CanGetNexusCompletion](node.Parent)
+			if err != nil {
+				return err
+			}
+			completion, err = target.GetNexusCompletion(ctx, callback.GetRequestId())
+			if err != nil {
+				return err
+			}
 		}
 
-		completion, err := target.GetNexusCompletion(ctx, callback.GetRequestId())
-		if err != nil {
-			return err
-		}
+		deliveryRequestID := cmp.Or(sub.GetRequestId(), callback.RequestId)
 
 		// CHASM internal callbacks make use of Nexus as their callback delivery
 		// mechanism, but with the internal delivery URL.
@@ -165,7 +191,7 @@ func (e taskExecutor) loadInvocationArgs(
 				nexus:      variant,
 				attempt:    callback.Attempt,
 				completion: completion,
-				requestID:  callback.RequestId,
+				requestID:  deliveryRequestID,
 			}
 		} else {
 			invokable = nexusInvocation{
@@ -173,13 +199,33 @@ func (e taskExecutor) loadInvocationArgs(
 				completion: completion,
 				workflowID: ref.WorkflowKey.WorkflowID,
 				runID:      ref.WorkflowKey.RunID,
-				requestID:  callback.RequestId,
+				requestID:  deliveryRequestID,
 				attempt:    callback.Attempt,
 			}
 		}
 		return nil
 	})
 	return
+}
+
+func validateResultSubscriptionForDelivery(
+	variant *persistencespb.Callback_Nexus,
+	sub *commonpb.Callback_ResultSubscription,
+) error {
+	if sub.GetResultFormatVersion() != resultSubscriptionFormatVersionV1 {
+		return queueserrors.NewUnprocessableTaskError(
+			fmt.Sprintf("unsupported result subscription format version: %d", sub.GetResultFormatVersion()),
+		)
+	}
+	if sub.GetRequestId() == "" {
+		return queueserrors.NewUnprocessableTaskError("result subscription callback missing request ID")
+	}
+	if variant.GetUrl() != commonnexus.SystemCallbackURL && variant.GetUrl() != chasm.NexusCompletionHandlerURL {
+		return queueserrors.NewUnprocessableTaskError(
+			fmt.Sprintf("unsupported callback URL for result subscription: %q", variant.GetUrl()),
+		)
+	}
+	return nil
 }
 
 func (e taskExecutor) saveResult(

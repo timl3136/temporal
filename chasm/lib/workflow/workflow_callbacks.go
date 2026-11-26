@@ -1,11 +1,14 @@
 package workflow
 
 import (
+	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/chasm/lib/callback"
 	callbackspb "go.temporal.io/server/chasm/lib/callback/gen/callbackpb/v1"
 	"go.temporal.io/server/common/nexus/nexusrpc"
 )
+
+var _ callback.ResultSubscriptionCompletionSource = (*Workflow)(nil)
 
 // CompletionCallbacks implements callback.Holder.
 func (w *Workflow) CompletionCallbacks() chasm.Map[string, *callback.Callback] {
@@ -31,6 +34,15 @@ func (w *Workflow) GetNexusCompletion(
 ) (nexusrpc.CompleteOperationOptions, error) {
 	// Retrieve the completion data from the underlying mutable state via MSPointer.
 	return w.MSPointer.GetNexusCompletion(ctx, requestID)
+}
+
+// GetResultSubscriptionCompletion implements callback.ResultSubscriptionCompletionSource.
+func (w *Workflow) GetResultSubscriptionCompletion(
+	ctx chasm.Context,
+	requestID string,
+	sub *commonpb.Callback_ResultSubscription,
+) (nexusrpc.CompleteOperationOptions, error) {
+	return w.GetWorkflowResultSubscriptionCompletion(ctx, requestID, sub)
 }
 
 // FindResultSubscription returns the callback whose ResultSubscription matches requestID.

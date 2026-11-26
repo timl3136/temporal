@@ -3,6 +3,7 @@ package chasm
 import (
 	"time"
 
+	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/server/common/nexus/nexusrpc"
@@ -71,6 +72,17 @@ func (m MSPointer) LoadHistoryEvent(ctx Context, token []byte) (*historypb.Histo
 // GetNexusCompletion retrieves the Nexus operation completion data for the given request ID from the underlying mutable state.
 func (m MSPointer) GetNexusCompletion(ctx Context, requestID string) (nexusrpc.CompleteOperationOptions, error) {
 	return m.backend.GetNexusCompletion(ctx.goContext(), requestID)
+}
+
+// GetWorkflowResultSubscriptionCompletion retrieves the GetWorkflowExecutionResult completion data from
+// the underlying mutable state. Named distinctly from callback.ResultSubscriptionCompletionSource so
+// components embedding MSPointer do not implicitly satisfy that interface.
+func (m MSPointer) GetWorkflowResultSubscriptionCompletion(
+	ctx Context,
+	requestID string,
+	sub *commonpb.Callback_ResultSubscription,
+) (nexusrpc.CompleteOperationOptions, error) {
+	return m.backend.GetResultSubscriptionCompletion(ctx.goContext(), requestID, sub)
 }
 
 // GetWorkflowTypeName retrieves the workflow type name from the underlying mutable state.
