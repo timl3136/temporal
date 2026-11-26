@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
@@ -17,8 +18,8 @@ import (
 
 const (
 	callerWorkflowID = "caller-wf"
-	callerRunID      = "11111111-1111-1111-1111-111111111111"
-	targetRunID      = "22222222-2222-2222-2222-222222222222"
+	callerRunID      = "abcdef01-2345-6789-abcd-ef0123456789"
+	targetRunID      = "fedcba98-7654-3210-fedc-ba9876543210"
 )
 
 func newResultProcessor(enabled bool) getWorkflowExecutionResultProcessor {
@@ -108,6 +109,9 @@ func TestGetWorkflowExecutionResultProcessor_InvalidInputFailsOperation(t *testi
 		{name: "malformed run ID", ctx: resultProcessorContext(true), request: resultRequest("target", "not-a-uuid"), message: "invalid RunId"},
 		{name: "self wait on current run", ctx: resultProcessorContext(true), request: resultRequest(callerWorkflowID, ""), message: "cannot wait for its own result"},
 		{name: "self wait on own run", ctx: resultProcessorContext(true), request: resultRequest(callerWorkflowID, callerRunID), message: "cannot wait for its own result"},
+		{name: "self wait on own run, uppercase", ctx: resultProcessorContext(true), request: resultRequest(callerWorkflowID, strings.ToUpper(callerRunID)), message: "cannot wait for its own result"},
+		{name: "self wait on own run, braced", ctx: resultProcessorContext(true), request: resultRequest(callerWorkflowID, "{"+callerRunID+"}"), message: "cannot wait for its own result"},
+		{name: "self wait on own run, urn", ctx: resultProcessorContext(false), request: resultRequest(callerWorkflowID, "urn:uuid:"+callerRunID), message: "cannot wait for its own result"},
 		{name: "invalid input at invocation", ctx: resultProcessorContext(false), request: resultRequest("", ""), message: "WorkflowId is not set"},
 		{name: "standalone caller", ctx: noCaller, request: resultRequest("target", ""), message: "can only be called from a workflow"},
 		{name: "empty caller", ctx: emptyCaller, request: resultRequest("target", ""), message: "can only be called from a workflow"},
@@ -124,6 +128,20 @@ func TestGetWorkflowExecutionResultProcessor_InvalidInputFailsOperation(t *testi
 			require.NoError(t, err)
 			require.Contains(t, failure.GetMessage(), "InvalidArgument: ")
 			require.Contains(t, failure.GetMessage(), tc.message)
+			require.True(t, failure.GetServerFailureInfo().GetNonRetryable(), "expected non-retryable server failure, got %v", failure)
 		})
 	}
+}
+
+func TestGetWorkflowExecutionResultProcessor_CanonicalizesRunID(t *testing.T) {
+	request := resultRequest("target", "{"+strings.ToUpper(targetRunID)+"}")
+	_, err := newResultProcessor(true).ProcessInput(resultProcessorContext(false), request)
+	require.NoError(t, err)
+	// Start sends the reserialized input, so the target sees the canonical run ID.
+	require.Equal(t, targetRunID, request.GetExecution().GetRunId())
+
+	t.Run("malformed run ID is not echoed", func(t *testing.T) {
+		_, err := newResultProcessor(true).ProcessInput(resultProcessorContext(false), resultRequest("target", "not-a-uuid"))
+		require.NotContains(t, err.Error(), "not-a-uuid")
+	})
 }

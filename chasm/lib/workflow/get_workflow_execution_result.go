@@ -1,12 +1,12 @@
 package workflow
 
 import (
-	"fmt"
-
 	"github.com/google/uuid"
 	"github.com/nexus-rpc/sdk-go/nexus"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/chasm"
+	"go.temporal.io/server/common/failure"
+	commonnexus "go.temporal.io/server/common/nexus"
 )
 
 type getWorkflowExecutionResultProcessor struct {
@@ -38,8 +38,13 @@ func (o getWorkflowExecutionResultProcessor) ProcessInput(
 	if execution.GetWorkflowId() == "" {
 		return nil, invalidResultRequest("WorkflowId is not set on the execution")
 	}
-	if execution.GetRunId() != "" && uuid.Validate(execution.GetRunId()) != nil {
-		return nil, invalidResultRequest("invalid RunId %q", execution.GetRunId())
+	if execution.GetRunId() != "" {
+		runID, err := uuid.Parse(execution.GetRunId())
+		if err != nil {
+			return nil, invalidResultRequest("invalid RunId")
+		}
+		// Canonicalize so the self-wait check below and the reserialized Start input see the stored form.
+		execution.RunId = runID.String()
 	}
 	// A running caller is the current run of its workflow ID, so an empty run ID also names itself.
 	if execution.GetWorkflowId() == caller.GetWorkflowId() &&
@@ -54,12 +59,16 @@ func (o getWorkflowExecutionResultProcessor) ProcessInput(
 	}, nil
 }
 
-func invalidResultRequest(format string, args ...any) error {
-	message := "InvalidArgument: " + fmt.Sprintf(format, args...)
+func invalidResultRequest(message string) error {
+	// Same non-retryable server failure the caller records for a History InvalidArgument rejection.
+	nexusFailure, err := commonnexus.TemporalFailureToNexusFailure(failure.NewServerFailure("InvalidArgument: "+message, true))
+	if err != nil {
+		return err
+	}
 	return &nexus.OperationError{
 		State:   nexus.OperationStateFailed,
-		Message: message,
+		Message: nexusFailure.Message,
 		// HSM records an operation error from its original failure.
-		OriginalFailure: &nexus.Failure{Message: message},
+		OriginalFailure: &nexusFailure,
 	}
 }

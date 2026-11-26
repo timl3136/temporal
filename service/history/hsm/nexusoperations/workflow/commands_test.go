@@ -1148,7 +1148,7 @@ func TestScheduleGetWorkflowExecutionResult(t *testing.T) {
 		tcx := newTestContext(t, &cfg)
 		tcx.execInfo.NamespaceId = tests.GlobalNamespaceEntry.ID().String()
 		tcx.execInfo.WorkflowId = "caller-workflow-id"
-		tcx.execState.RunId = "11111111-1111-1111-1111-111111111111"
+		tcx.execState.RunId = "abcdef01-2345-6789-abcd-ef0123456789"
 		dc := dynamicconfig.NewCollection(dynamicconfig.StaticClient{
 			dynamicconfig.EnableGetWorkflowExecutionResultFromWorkflow.Key(): enabled,
 		}, log.NewNoopLogger())
@@ -1173,13 +1173,22 @@ func TestScheduleGetWorkflowExecutionResult(t *testing.T) {
 		return tcx.history, err
 	}
 
-	t.Run("flag off fails the workflow task", func(t *testing.T) {
-		history, err := schedule(t, false, "target", "")
-		var failWFTErr chasmworkflow.FailWorkflowTaskError
-		require.ErrorAs(t, err, &failWFTErr)
-		require.Equal(t, enumspb.WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES, failWFTErr.Cause)
-		require.Empty(t, history.Events)
-	})
+	for _, tc := range []struct {
+		name       string
+		workflowID string
+		runID      string
+	}{
+		{name: "valid", workflowID: "target"},
+		{name: "invalid input", runID: "not-a-uuid"},
+	} {
+		t.Run("flag off fails the workflow task: "+tc.name, func(t *testing.T) {
+			history, err := schedule(t, false, tc.workflowID, tc.runID)
+			var failWFTErr chasmworkflow.FailWorkflowTaskError
+			require.ErrorAs(t, err, &failWFTErr)
+			require.Equal(t, enumspb.WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES, failWFTErr.Cause)
+			require.Empty(t, history.Events)
+		})
+	}
 
 	// Invalid input is admitted so the operation, not the workflow task, fails when it is invoked.
 	for _, tc := range []struct {
@@ -1190,7 +1199,8 @@ func TestScheduleGetWorkflowExecutionResult(t *testing.T) {
 		{name: "valid", workflowID: "target"},
 		{name: "empty workflow ID"},
 		{name: "malformed run ID", workflowID: "target", runID: "not-a-uuid"},
-		{name: "self wait", workflowID: "caller-workflow-id"},
+		{name: "self wait on current run", workflowID: "caller-workflow-id"},
+		{name: "self wait on own run", workflowID: "caller-workflow-id", runID: "abcdef01-2345-6789-abcd-ef0123456789"},
 	} {
 		t.Run("flag on schedules: "+tc.name, func(t *testing.T) {
 			history, err := schedule(t, true, tc.workflowID, tc.runID)

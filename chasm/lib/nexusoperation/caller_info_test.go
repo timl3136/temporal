@@ -23,10 +23,12 @@ import (
 )
 
 type callerInfoProcessor struct {
+	t      *testing.T
 	caller *historyservice.NexusCallerInfo
 }
 
 func (p *callerInfoProcessor) ProcessInput(ctx chasm.NexusOperationProcessorContext, _ *emptypb.Empty) (*chasm.NexusOperationProcessorResult, error) {
+	require.False(p.t, ctx.Scheduling, "Start and Cancel only route")
 	p.caller = ctx.Caller
 	return &chasm.NexusOperationProcessorResult{
 		RoutingKey: chasm.NexusOperationRoutingKeyExecution{NamespaceID: "target-ns", BusinessID: "target-wf"},
@@ -35,7 +37,7 @@ func (p *callerInfoProcessor) ProcessInput(ctx chasm.NexusOperationProcessorCont
 
 func newCallerInfoInvocationTest(t *testing.T) (*invocationSystem, *historyservicemock.MockHistoryServiceClient, *callerInfoProcessor, chasm.ExecutionKey) {
 	t.Helper()
-	processor := &callerInfoProcessor{}
+	processor := &callerInfoProcessor{t: t}
 	serviceProcessor := chasm.NewNexusServiceProcessor("caller-info-test")
 	serviceProcessor.MustRegisterOperation("test", chasm.NewRegisterableNexusOperationProcessor(processor))
 	endpointProcessor := chasm.NewNexusEndpointProcessor()

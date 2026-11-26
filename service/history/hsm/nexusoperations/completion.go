@@ -9,7 +9,6 @@ import (
 	"github.com/nexus-rpc/sdk-go/nexus"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
-	failurepb "go.temporal.io/api/failure/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/serviceerror"
 	chasmnexus "go.temporal.io/server/chasm/lib/nexusoperation"
@@ -53,24 +52,9 @@ func handleOperationError(
 	if err != nil {
 		return err
 	}
-	var originalCause *failurepb.Failure
-	// Special marker for Temporal->Temporal calls to indicate that the original failure should be unwrapped.
-	// Temporal uses a wrapper operation error with no additional information to transmit the OperationError over the network.
-	// The meaningful information is in the operation error's cause.
-	unwrapError := opErr.OriginalFailure.Metadata["unwrap-error"] == "true"
-
-	if unwrapError && opErr.OriginalFailure.Cause != nil {
-		var err error
-		originalCause, err = commonnexus.NexusFailureToTemporalFailure(*opErr.OriginalFailure.Cause)
-		if err != nil {
-			return serviceerror.NewInvalidArgumentf("Malformed failure: %v", err)
-		}
-	} else {
-		// Transform the OperationError to either ApplicationFailure or CanceledFailure based on the operation error state.
-		originalCause, err = commonnexus.NexusFailureToTemporalFailure(*opErr.OriginalFailure)
-		if err != nil {
-			return serviceerror.NewInvalidArgumentf("Malformed failure: %v", err)
-		}
+	originalCause, err := commonnexus.OperationErrorToTemporalFailure(opErr)
+	if err != nil {
+		return serviceerror.NewInvalidArgumentf("Malformed failure: %v", err)
 	}
 
 	switch opErr.State { // nolint:exhaustive

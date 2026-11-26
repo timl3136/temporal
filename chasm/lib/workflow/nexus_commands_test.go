@@ -1139,6 +1139,13 @@ func TestScheduleGetWorkflowExecutionResult(t *testing.T) {
 
 	schedule := func(t *testing.T, enabled bool, workflowID, runID string) (*historypb.History, error) {
 		tcx := newTestContext(t, &cfg, callerWorkflowID)
+		tcx.chasmCtx.HandleExecutionKey = func() chasm.ExecutionKey {
+			return chasm.ExecutionKey{
+				NamespaceID: tests.GlobalNamespaceEntry.ID().String(),
+				BusinessID:  callerWorkflowID,
+				RunID:       callerRunID,
+			}
+		}
 		serviceProcessor := chasm.NewNexusServiceProcessor(svc.ServiceName)
 		serviceProcessor.MustRegisterOperation(svc.GetWorkflowExecutionResult.Name(), NewGetWorkflowExecutionResultOperationProcessor(newResultProcessor(enabled).config))
 		tcx.nexusProcessor.MustRegisterServiceProcessor(serviceProcessor)
@@ -1157,13 +1164,22 @@ func TestScheduleGetWorkflowExecutionResult(t *testing.T) {
 		return tcx.history, err
 	}
 
-	t.Run("flag off fails the workflow task", func(t *testing.T) {
-		history, err := schedule(t, false, "target", "")
-		var failWFTErr FailWorkflowTaskError
-		require.ErrorAs(t, err, &failWFTErr)
-		require.Equal(t, enumspb.WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES, failWFTErr.Cause)
-		require.Empty(t, history.Events)
-	})
+	for _, tc := range []struct {
+		name       string
+		workflowID string
+		runID      string
+	}{
+		{name: "valid", workflowID: "target"},
+		{name: "invalid input", runID: "not-a-uuid"},
+	} {
+		t.Run("flag off fails the workflow task: "+tc.name, func(t *testing.T) {
+			history, err := schedule(t, false, tc.workflowID, tc.runID)
+			var failWFTErr FailWorkflowTaskError
+			require.ErrorAs(t, err, &failWFTErr)
+			require.Equal(t, enumspb.WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES, failWFTErr.Cause)
+			require.Empty(t, history.Events)
+		})
+	}
 
 	// Invalid input is admitted so the operation, not the workflow task, fails when it is invoked.
 	for _, tc := range []struct {
@@ -1174,7 +1190,8 @@ func TestScheduleGetWorkflowExecutionResult(t *testing.T) {
 		{name: "valid", workflowID: "target"},
 		{name: "empty workflow ID"},
 		{name: "malformed run ID", workflowID: "target", runID: "not-a-uuid"},
-		{name: "self wait", workflowID: callerWorkflowID},
+		{name: "self wait on current run", workflowID: callerWorkflowID},
+		{name: "self wait on own run", workflowID: callerWorkflowID, runID: callerRunID},
 	} {
 		t.Run("flag on schedules: "+tc.name, func(t *testing.T) {
 			history, err := schedule(t, true, tc.workflowID, tc.runID)

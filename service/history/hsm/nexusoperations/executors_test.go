@@ -29,6 +29,7 @@ import (
 	"go.temporal.io/server/common/backoff"
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/dynamicconfig"
+	"go.temporal.io/server/common/failure"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
@@ -1815,6 +1816,7 @@ type testOperationProcessor struct {
 }
 
 func (t *testOperationProcessor) ProcessInput(ctx chasm.NexusOperationProcessorContext, input *testOperationProcessorInput) (*chasm.NexusOperationProcessorResult, error) {
+	require.False(t.t, ctx.Scheduling, "Start and Cancel only route")
 	require.NotNil(t.t, ctx.Caller)
 	require.Equal(t.t, "ns-id", ctx.Caller.GetNamespaceId())
 	require.Equal(t.t, "wf-id", ctx.Caller.GetWorkflowId())
@@ -2079,11 +2081,7 @@ func TestProcessInvocationTask_SystemEndpoint(t *testing.T) {
 			},
 			setupChasmRegistry: func(t *testing.T) *chasm.Registry {
 				return &chasm.Registry{NexusEndpointProcessor: createTestNexusEndpointProcessor(t, nil,
-					&nexus.OperationError{
-						State:           nexus.OperationStateFailed,
-						Message:         "InvalidArgument: bad input",
-						OriginalFailure: &nexus.Failure{Message: "InvalidArgument: bad input"},
-					})}
+					invalidArgumentOperationError(t))}
 			},
 			expectedMetricOutcome: "operation-processor-failed",
 			checkOutcome: func(t *testing.T, op nexusoperations.Operation, events []*historypb.HistoryEvent) {
@@ -2091,6 +2089,7 @@ func TestProcessInvocationTask_SystemEndpoint(t *testing.T) {
 				require.Len(t, events, 1)
 				failure := events[0].GetNexusOperationFailedEventAttributes().GetFailure().GetCause()
 				require.Equal(t, "InvalidArgument: bad input", failure.GetMessage())
+				require.True(t, failure.GetServerFailureInfo().GetNonRetryable())
 			},
 		},
 		{
@@ -2349,4 +2348,11 @@ func TestCallerRPSLimitRetriesInQueue(t *testing.T) {
 			})
 		}
 	}
+}
+
+// invalidArgumentOperationError is the shape a system processor returns to fail an operation on invalid input.
+func invalidArgumentOperationError(t *testing.T) *nexus.OperationError {
+	nf, err := commonnexus.TemporalFailureToNexusFailure(failure.NewServerFailure("InvalidArgument: bad input", true))
+	require.NoError(t, err)
+	return &nexus.OperationError{State: nexus.OperationStateFailed, Message: nf.Message, OriginalFailure: &nf}
 }

@@ -25,6 +25,7 @@ import (
 	"go.temporal.io/server/common/backoff"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/dynamicconfig"
+	"go.temporal.io/server/common/failure"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
@@ -1256,11 +1257,7 @@ func TestInvocationTaskHandler_SystemEndpoint(t *testing.T) {
 				reg := chasm.NewRegistry(log.NewNoopLogger())
 				serviceProc := chasm.NewNexusServiceProcessor("service")
 				serviceProc.MustRegisterOperation("operation", chasm.NewRegisterableNexusOperationProcessor(&testStartProcessor{
-					err: &nexus.OperationError{
-						State:           nexus.OperationStateFailed,
-						Message:         "InvalidArgument: bad input",
-						OriginalFailure: &nexus.Failure{Message: "InvalidArgument: bad input"},
-					},
+					err: invalidArgumentOperationError(t),
 				}))
 				reg.NexusEndpointProcessor.MustRegisterServiceProcessor(serviceProc)
 				return reg
@@ -1269,6 +1266,7 @@ func TestInvocationTaskHandler_SystemEndpoint(t *testing.T) {
 			checkOutcome: func(t *testing.T, op *Operation) {
 				require.Equal(t, nexusoperationpb.OPERATION_STATUS_FAILED, op.Status)
 				require.Equal(t, "InvalidArgument: bad input", op.LastAttemptFailure.GetMessage())
+				require.True(t, op.LastAttemptFailure.GetServerFailureInfo().GetNonRetryable())
 			},
 		},
 		{
@@ -1497,4 +1495,11 @@ func TestCallerRPSLimitRetriesInQueue(t *testing.T) {
 			})
 		}
 	}
+}
+
+// invalidArgumentOperationError is the shape a system processor returns to fail an operation on invalid input.
+func invalidArgumentOperationError(t *testing.T) *nexus.OperationError {
+	nf, err := commonnexus.TemporalFailureToNexusFailure(failure.NewServerFailure("InvalidArgument: bad input", true))
+	require.NoError(t, err)
+	return &nexus.OperationError{State: nexus.OperationStateFailed, Message: nf.Message, OriginalFailure: &nf}
 }
