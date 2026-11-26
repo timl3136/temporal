@@ -3,13 +3,14 @@ package nexusoperation
 import (
 	"context"
 	"errors"
+	commonpb "go.temporal.io/api/common/v1"
 	"testing"
 	"time"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/stretchr/testify/require"
-	historyservice "go.temporal.io/server/api/historyservice/v1"
-	historyservicemock "go.temporal.io/server/api/historyservicemock/v1"
+	"go.temporal.io/server/api/historyservice/v1"
+	"go.temporal.io/server/api/historyservicemock/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
 	nexusoperationpb "go.temporal.io/server/chasm/lib/nexusoperation/gen/nexusoperationpb/v1"
@@ -87,6 +88,24 @@ func TestInvocationSystemStartPassesCallerInfo(t *testing.T) {
 	_, err = system.Start(t.Context(), args, nexus.StartOperationOptions{})
 	require.ErrorIs(t, err, callErr)
 	require.Equal(t, expected, processor.caller)
+}
+
+func TestLoadStartArgsStandaloneHasNoCallerInfo(t *testing.T) {
+	op := NewOperation(&nexusoperationpb.OperationState{
+		Service:       "caller-info-test",
+		Operation:     "test",
+		RequestId:     "standalone-request-id",
+		ScheduledTime: timestamppb.New(time.Now()),
+	})
+	op.RequestData = chasm.NewDataField(nil, &nexusoperationpb.OperationRequestData{Input: &commonpb.Payload{}})
+	key := chasm.ExecutionKey{NamespaceID: "ns", BusinessID: "op-id", RunID: "run"}
+	ns := namespace.NewNamespaceForTest(&persistencespb.NamespaceInfo{Id: key.NamespaceID, Name: "ns"}, nil, false, nil, 0)
+	args, err := op.loadStartArgs(&chasm.MockContext{
+		HandleExecutionKey:   func() chasm.ExecutionKey { return key },
+		HandleNamespaceEntry: func() *namespace.Namespace { return ns },
+	}, chasm.NoValue(nil))
+	require.NoError(t, err)
+	require.Nil(t, args.callerInfo)
 }
 
 func TestInvocationSystemCancelPassesCallerInfo(t *testing.T) {

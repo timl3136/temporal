@@ -156,6 +156,7 @@ var (
 
 		// P3: Status Querying APIs
 		"/temporal.api.workflowservice.v1.WorkflowService/DescribeWorkflowExecution":                    3,
+		"/temporal.api.workflowservice.v1.WorkflowService/GetWorkflowExecutionResult":                   3,
 		"/temporal.api.workflowservice.v1.WorkflowService/DescribeActivityExecution":                    3,
 		"/temporal.api.workflowservice.v1.WorkflowService/DescribeTaskQueue":                            3,
 		"/temporal.api.workflowservice.v1.WorkflowService/GetWorkerBuildIdCompatibility":                3,

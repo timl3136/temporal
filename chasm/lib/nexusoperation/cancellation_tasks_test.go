@@ -308,6 +308,7 @@ func TestCancellationLoadArgs_StandaloneFallsBackToRequestData(t *testing.T) {
 	protorequire.ProtoEqual(t, input, args.payload)
 	require.NotSame(t, &headers, &args.headers) // Confirm we make a copy.
 	require.Equal(t, headers, args.headers)     // But they are structually equivalent.
+	require.Nil(t, args.callerInfo)
 }
 
 func TestCancellationInvocationTaskHandler_HTTP(t *testing.T) {
