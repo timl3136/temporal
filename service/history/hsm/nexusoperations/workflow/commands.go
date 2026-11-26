@@ -378,10 +378,15 @@ func (ch *commandHandler) HandleCancelCommand(
 	if err != nil {
 		return err
 	}
-	if commonnexus.IsGetWorkflowExecutionResult(op.Endpoint, op.Service, op.Operation) &&
-		nexusoperations.TransitionStarted.Possible(op) {
-		return nexusoperations.RecordCanceled(node, commonnexus.ResultSubscriptionCanceledFailure())
+	if !commonnexus.IsGetWorkflowExecutionResult(op.Endpoint, op.Service, op.Operation) ||
+		!nexusoperations.TransitionStarted.Possible(op) {
+		return nil
 	}
+	namespaceName, workflowType, closeTime := node.NamespaceName(), node.WorkflowTypeName(), node.WorkflowTime()
+	if err := nexusoperations.RecordCanceled(node, commonnexus.ResultSubscriptionCanceledFailure()); err != nil {
+		return err
+	}
+	nexusoperations.EmitOperationCanceled(ch.metricsHandler, ch.config, op, namespaceName, workflowType, closeTime)
 	return nil
 }
 

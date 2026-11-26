@@ -196,7 +196,14 @@ func (w *Workflow) OnNexusOperationCancellationCompleted(ctx chasm.MutableContex
 		// nolint:revive // We must mutate here even if the linter doesn't like it.
 		e.WorkerMayIgnore = true // For compatibility with older SDKs.
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	// The target acknowledged removing the subscription and will never report it back (DEC-4).
+	if commonnexus.IsGetWorkflowExecutionResult(op.GetEndpoint(), op.GetService(), op.GetOperation()) {
+		return w.OnNexusOperationCanceled(ctx, op, commonnexus.ResultSubscriptionCanceledFailure())
+	}
+	return nil
 }
 
 func (w *Workflow) OnNexusOperationCancellationFailed(ctx chasm.MutableContext, op *nexusoperation.Operation, failure *failurepb.Failure) error {

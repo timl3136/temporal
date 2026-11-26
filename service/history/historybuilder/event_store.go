@@ -141,11 +141,10 @@ func (b *EventStore) HasBufferEvents() bool {
 	return len(b.dbBufferBatch) > 0 || len(b.memBufferBatch) > 0
 }
 
-// HasAnyBufferedEvent returns true if there is at least one buffered event that matches the provided filter.
+// HasAnyBufferedEvent returns true if an event buffered by an earlier transaction matches the provided filter.
+// Events buffered by the current transaction are ignored: a command handler must not treat an outcome that it or an
+// earlier command in the same workflow task just produced as one that raced the workflow task.
 func (b *EventStore) HasAnyBufferedEvent(predicate BufferedEventFilter) bool {
-	if slices.ContainsFunc(b.memBufferBatch, predicate) {
-		return true
-	}
 	return slices.ContainsFunc(b.dbBufferBatch, predicate)
 }
 

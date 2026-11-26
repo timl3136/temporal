@@ -30,6 +30,7 @@ import (
 	commonnexus "go.temporal.io/server/common/nexus"
 	"go.temporal.io/server/common/nexus/nexustest"
 	sdkconverter "go.temporal.io/server/common/sdk"
+	"go.temporal.io/server/service/history/historybuilder"
 	"go.temporal.io/server/service/history/hsm"
 	"go.temporal.io/server/service/history/hsm/nexusoperations"
 	opsworkflow "go.temporal.io/server/service/history/hsm/nexusoperations/workflow"
@@ -61,6 +62,12 @@ type testContext struct {
 	metricsCapture  *metricstest.Capture
 	callerCapture   *callerInfoCapture
 	nexusProcessor  *chasm.NexusEndpointProcessor
+	// builder, when set, receives the added events so buffering follows the real history builder.
+	builder *builderRef
+}
+
+type builderRef struct {
+	b *historybuilder.HistoryBuilder
 }
 
 type callerInfoCapture struct {
@@ -117,7 +124,13 @@ func newTestContext(t *testing.T, cfg *nexusoperations.Config) testContext {
 	ms.EXPECT().HSM().Return(node).AnyTimes()
 	lastEventID := int64(4)
 	history := &historypb.History{}
+	builder := &builderRef{}
 	ms.EXPECT().AddHistoryEvent(gomock.Any(), gomock.Any()).DoAndReturn(func(t enumspb.EventType, setAttrs func(he *historypb.HistoryEvent)) *historypb.HistoryEvent {
+		if builder.b != nil {
+			e := builder.b.AddHistoryEvent(t, setAttrs)
+			history.Events = append(history.Events, e)
+			return e
+		}
 		e := &historypb.HistoryEvent{
 			EventType: t,
 			Version:   1,
@@ -155,6 +168,7 @@ func newTestContext(t *testing.T, cfg *nexusoperations.Config) testContext {
 		metricsCapture:  metricsCapture,
 		callerCapture:   callerCapture,
 		nexusProcessor:  chasmReg.NexusEndpointProcessor,
+		builder:         builder,
 	}
 }
 

@@ -448,15 +448,13 @@ func TestHistoryBuilder_HasAnyBufferedEvent(t *testing.T) {
 		}
 	}
 
-	t.Run("when there is an event in memBufferBatch which matches filter should produce true", func(t *testing.T) {
+	t.Run("an event buffered by the current transaction is ignored", func(t *testing.T) {
 		historyBuilder := newSUT()
 		historyBuilder.AddActivityTaskCompletedEvent()
 		historyBuilder.AddActivityTaskStartedEvent()
 		historyBuilder.AddActivityTaskCompletedEvent()
-		if historyBuilder.HasAnyBufferedEvent(isTaskStartedEvent) == false {
-			t.Error(
-				"ActivityTaskScheduledEvent in history, expected HasAnyBufferedEvent(isTaskStarted) to return true got false",
-			)
+		if historyBuilder.HasAnyBufferedEvent(isTaskStartedEvent) {
+			t.Error("expected HasAnyBufferedEvent to ignore events in memBufferBatch")
 		}
 	})
 

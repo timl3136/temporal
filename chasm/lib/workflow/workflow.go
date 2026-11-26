@@ -340,7 +340,7 @@ func (w *Workflow) HasIncomingSignalEvent(_ chasm.Context, requestID string) boo
 	return exists
 }
 
-// HasAnyBufferedEvent returns true if the workflow has any buffered event matching the given filter.
+// HasAnyBufferedEvent returns true if an event buffered by an earlier transaction matches the given filter.
 func (w *Workflow) HasAnyBufferedEvent(filter historybuilder.BufferedEventFilter) bool {
 	return w.MSPointer.HasAnyBufferedEvent(filter)
 }

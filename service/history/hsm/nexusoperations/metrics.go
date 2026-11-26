@@ -55,6 +55,11 @@ func emitOperationFailed(base metrics.Handler, tagConfig chasmnexus.NexusMetricT
 	emitOperationOutcome(base, tagConfig, op, namespaceName, workflowType, nexusoperationpb.OPERATION_STATUS_FAILED, closeTime, chasmnexus.NexusOperationFailedCount.With, metrics.ReasonTag(reason))
 }
 
+// EmitOperationCanceled emits the canceled outcome for an operation the caller canceled without a handler outcome.
+func EmitOperationCanceled(base metrics.Handler, config *Config, op Operation, namespaceName, workflowType string, closeTime time.Time) {
+	emitOperationCanceled(base, config.ResolvedMetricTagConfig(), op, namespaceName, workflowType, closeTime)
+}
+
 // emitOperationCanceled emits the cancel counter and latency metrics for an operation that
 // completed as canceled.
 func emitOperationCanceled(base metrics.Handler, tagConfig chasmnexus.NexusMetricTagConfig, op Operation, namespaceName, workflowType string, closeTime time.Time) {

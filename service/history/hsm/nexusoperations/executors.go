@@ -949,14 +949,26 @@ func (e taskExecutor) loadArgsForCancelation(ctx context.Context, env hsm.Enviro
 
 //nolint:revive // The legacy executor is kept intact while existing HSM operations remain loadable.
 func (e taskExecutor) saveCancelationResult(ctx context.Context, env hsm.Environment, ref hsm.Ref, callErr error, scheduledEventID int64) error {
-	return env.Access(ctx, ref, hsm.AccessWrite, func(n *hsm.Node) error {
-		err := hsm.MachineTransition(n, func(c Cancelation) (hsm.TransitionOutput, error) {
+	// Emitted after the write commits so a failed commit, which retries the task, does not double count.
+	var emitMetrics func()
+	err := env.Access(ctx, ref, hsm.AccessWrite, func(n *hsm.Node) error {
+		op, err := hsm.MachineData[Operation](n.Parent)
+		if err != nil {
+			return err
+		}
+		isResultOp := commonnexus.IsGetWorkflowExecutionResult(op.Endpoint, op.Service, op.Operation)
+		err = hsm.MachineTransition(n, func(c Cancelation) (hsm.TransitionOutput, error) {
 			if callErr != nil {
 				var handlerErr *nexus.HandlerError
 				var opTimeoutBelowMinErr *operationTimeoutBelowMinError
 				isRetryable := !errors.As(callErr, &opTimeoutBelowMinErr) &&
 					!errors.Is(callErr, commonnexus.ErrRedirectNotAllowed) &&
 					(!errors.As(callErr, &handlerErr) || handlerErr.Retryable())
+				// Classify History errors by code, as the CHASM caller does. Scoped to this operation so other
+				// operations keep retrying every History error.
+				if serviceErr, ok := errors.AsType[serviceerror.ServiceError](callErr); ok && isResultOp {
+					isRetryable = common.IsRetryableRPCError(serviceErr)
+				}
 				failure, err := callErrToFailure(callErr, isRetryable)
 				if err != nil {
 					return hsm.TransitionOutput{}, err
@@ -1010,19 +1022,23 @@ func (e taskExecutor) saveCancelationResult(ctx context.Context, env hsm.Environ
 				Node: n,
 			})
 		})
-		if err != nil || callErr != nil {
-			return err
-		}
-		op, err := hsm.MachineData[Operation](n.Parent)
-		if err != nil {
+		if err != nil || callErr != nil || !isResultOp {
 			return err
 		}
 		// The target acknowledged removing the subscription and will never report it back (DEC-4).
-		if commonnexus.IsGetWorkflowExecutionResult(op.Endpoint, op.Service, op.Operation) {
-			return RecordCanceled(n.Parent, commonnexus.ResultSubscriptionCanceledFailure())
+		namespaceName, workflowType, closeTime := n.NamespaceName(), n.WorkflowTypeName(), n.WorkflowTime()
+		if err := RecordCanceled(n.Parent, commonnexus.ResultSubscriptionCanceledFailure()); err != nil {
+			return err
+		}
+		emitMetrics = func() {
+			emitOperationCanceled(e.MetricsHandler, e.metricTagConfig(), op, namespaceName, workflowType, closeTime)
 		}
 		return nil
 	})
+	if err == nil && emitMetrics != nil {
+		emitMetrics()
+	}
+	return err
 }
 
 func (e taskExecutor) executeCancelationBackoffTask(env hsm.Environment, node *hsm.Node, task CancelationBackoffTask) error {

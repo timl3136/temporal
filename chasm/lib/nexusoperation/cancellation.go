@@ -12,7 +12,6 @@ import (
 	"go.temporal.io/server/chasm"
 	nexusoperationpb "go.temporal.io/server/chasm/lib/nexusoperation/gen/nexusoperationpb/v1"
 	"go.temporal.io/server/common/backoff"
-	commonnexus "go.temporal.io/server/common/nexus"
 )
 
 var _ chasm.Component = (*Cancellation)(nil)
@@ -77,14 +76,7 @@ type cancelArgs struct {
 func (c *Cancellation) onCompleted(ctx chasm.MutableContext) error {
 	op := c.Operation.Get(ctx)
 	if store, ok := op.Store.TryGet(ctx); ok {
-		if err := store.OnNexusOperationCancellationCompleted(ctx, op); err != nil {
-			return err
-		}
-		// The target acknowledged removing the subscription and will never report it back (DEC-4).
-		if commonnexus.IsGetWorkflowExecutionResult(op.GetEndpoint(), op.GetService(), op.GetOperation()) {
-			return op.onCanceled(ctx, commonnexus.ResultSubscriptionCanceledFailure())
-		}
-		return nil
+		return store.OnNexusOperationCancellationCompleted(ctx, op)
 	}
 	return TransitionCancellationSucceeded.Apply(c, ctx, EventCancellationSucceeded{})
 }
