@@ -23,6 +23,9 @@ type NexusOperationProcessorContext struct {
 	// Caller identifies the workflow execution that scheduled this operation, if any.
 	Caller *historyservice.NexusCallerInfo
 	Links  []nexus.Link
+	// Scheduling is true only when validating a schedule command. Processors gate admission (e.g. feature flags) on
+	// it; the Start and Cancel RPCs re-run the processor for routing only, so a gate there would strand accepted work.
+	Scheduling bool
 	// A boolean indicating whether the operation processor framework should re-serialize the input and store it in the
 	// [NexusOperationProcessorResult.ReserializedInputPayload] field. Processor implementations may mutate the input regardless.
 	ReserializeInputPayload bool

@@ -2072,6 +2072,28 @@ func TestProcessInvocationTask_SystemEndpoint(t *testing.T) {
 			},
 		},
 		{
+			// A processor rejects invalid input with an operation error: the operation fails before any history RPC.
+			name: "chasm processor operation error",
+			setupHistoryClient: func(t *testing.T, ctrl *gomock.Controller) resource.HistoryClient {
+				return historyservicemock.NewMockHistoryServiceClient(ctrl)
+			},
+			setupChasmRegistry: func(t *testing.T) *chasm.Registry {
+				return &chasm.Registry{NexusEndpointProcessor: createTestNexusEndpointProcessor(t, nil,
+					&nexus.OperationError{
+						State:           nexus.OperationStateFailed,
+						Message:         "InvalidArgument: bad input",
+						OriginalFailure: &nexus.Failure{Message: "InvalidArgument: bad input"},
+					})}
+			},
+			expectedMetricOutcome: "operation-processor-failed",
+			checkOutcome: func(t *testing.T, op nexusoperations.Operation, events []*historypb.HistoryEvent) {
+				require.Equal(t, enumsspb.NEXUS_OPERATION_STATE_FAILED, op.State())
+				require.Len(t, events, 1)
+				failure := events[0].GetNexusOperationFailedEventAttributes().GetFailure().GetCause()
+				require.Equal(t, "InvalidArgument: bad input", failure.GetMessage())
+			},
+		},
+		{
 			name: "chasm processor error",
 			setupHistoryClient: func(t *testing.T, ctrl *gomock.Controller) resource.HistoryClient {
 				// Should not be called if processor fails

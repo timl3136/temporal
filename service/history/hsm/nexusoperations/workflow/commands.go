@@ -71,8 +71,9 @@ func (ch *commandHandler) HandleScheduleCommand(
 		executionInfo := ms.GetExecutionInfo()
 		executionState := ms.GetExecutionState()
 		_, err := ch.nexusProcessor.ProcessInput(chasm.NexusOperationProcessorContext{
-			Namespace: ns,
-			RequestID: requestID,
+			Namespace:  ns,
+			RequestID:  requestID,
+			Scheduling: true,
 			Caller: &historyservice.NexusCallerInfo{
 				NamespaceId: executionInfo.GetNamespaceId(),
 				WorkflowId:  executionInfo.GetWorkflowId(),
@@ -81,6 +82,10 @@ func (ch *commandHandler) HandleScheduleCommand(
 			},
 			// Links are not needed for validation.
 		}, attrs.Service, attrs.Operation, attrs.Input)
+		if _, ok := errors.AsType[*nexus.OperationError](err); ok {
+			// Admit the command: the operation records this failure when it is invoked.
+			err = nil
+		}
 		if err != nil {
 			_, isNotFound := errors.AsType[*serviceerror.NotFound](err)
 			_, isInvalidArgument := errors.AsType[*serviceerror.InvalidArgument](err)

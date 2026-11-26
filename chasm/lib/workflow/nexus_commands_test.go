@@ -13,6 +13,7 @@ import (
 	historypb "go.temporal.io/api/history/v1"
 	sdkpb "go.temporal.io/api/sdk/v1"
 	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/api/workflowservice/v1/workflowservicenexus"
 	"go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
@@ -1126,6 +1127,60 @@ func TestOperationNodeDeletionOnTerminalEvents(t *testing.T) {
 			}
 
 			applyTerminalEventAndAssertDeletion(t, tcx, scheduledEvent.EventId, tc.eventType, tc.eventAttr)
+		})
+	}
+}
+
+func TestScheduleGetWorkflowExecutionResult(t *testing.T) {
+	svc := workflowservicenexus.TemporalAPIWorkflowserviceV1WorkflowService
+	cfg := *defaultConfig
+	cfg.MaxServiceNameLength = dynamicconfig.GetIntPropertyFnFilteredByNamespace(len(svc.ServiceName))
+	cfg.MaxOperationNameLength = dynamicconfig.GetIntPropertyFnFilteredByNamespace(len(svc.GetWorkflowExecutionResult.Name()))
+
+	schedule := func(t *testing.T, enabled bool, workflowID, runID string) (*historypb.History, error) {
+		tcx := newTestContext(t, &cfg, callerWorkflowID)
+		serviceProcessor := chasm.NewNexusServiceProcessor(svc.ServiceName)
+		serviceProcessor.MustRegisterOperation(svc.GetWorkflowExecutionResult.Name(), NewGetWorkflowExecutionResultOperationProcessor(newResultProcessor(enabled).config))
+		tcx.nexusProcessor.MustRegisterServiceProcessor(serviceProcessor)
+		input, err := sdkconverter.PreferProtoDataConverter.ToPayloads(resultRequest(workflowID, runID))
+		require.NoError(t, err)
+		err = tcx.scheduleHandler(tcx.chasmCtx, tcx.wf, commandValidator{maxPayloadSize: 1000}, &commandpb.Command{
+			Attributes: &commandpb.Command_ScheduleNexusOperationCommandAttributes{
+				ScheduleNexusOperationCommandAttributes: &commandpb.ScheduleNexusOperationCommandAttributes{
+					Endpoint:  commonnexus.SystemEndpoint,
+					Service:   svc.ServiceName,
+					Operation: svc.GetWorkflowExecutionResult.Name(),
+					Input:     input.Payloads[0],
+				},
+			},
+		}, CommandHandlerOptions{WorkflowTaskCompletedEventID: 1})
+		return tcx.history, err
+	}
+
+	t.Run("flag off fails the workflow task", func(t *testing.T) {
+		history, err := schedule(t, false, "target", "")
+		var failWFTErr FailWorkflowTaskError
+		require.ErrorAs(t, err, &failWFTErr)
+		require.Equal(t, enumspb.WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES, failWFTErr.Cause)
+		require.Empty(t, history.Events)
+	})
+
+	// Invalid input is admitted so the operation, not the workflow task, fails when it is invoked.
+	for _, tc := range []struct {
+		name       string
+		workflowID string
+		runID      string
+	}{
+		{name: "valid", workflowID: "target"},
+		{name: "empty workflow ID"},
+		{name: "malformed run ID", workflowID: "target", runID: "not-a-uuid"},
+		{name: "self wait", workflowID: callerWorkflowID},
+	} {
+		t.Run("flag on schedules: "+tc.name, func(t *testing.T) {
+			history, err := schedule(t, true, tc.workflowID, tc.runID)
+			require.NoError(t, err)
+			require.Len(t, history.Events, 1)
+			require.NotNil(t, history.Events[0].GetNexusOperationScheduledEventAttributes())
 		})
 	}
 }

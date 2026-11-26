@@ -69,8 +69,9 @@ func (ch *nexusCommandHandler) handleScheduleCommand(
 		// Run ProcessInput for validation.
 		executionKey := ctx.ExecutionKey()
 		_, err := ch.nexusProcessor.ProcessInput(chasm.NexusOperationProcessorContext{
-			Namespace: ns,
-			RequestID: requestID,
+			Namespace:  ns,
+			RequestID:  requestID,
+			Scheduling: true,
 			Caller: &historyservice.NexusCallerInfo{
 				NamespaceId: executionKey.NamespaceID,
 				WorkflowId:  executionKey.BusinessID,
@@ -79,6 +80,10 @@ func (ch *nexusCommandHandler) handleScheduleCommand(
 			},
 			// Links are not needed for validation.
 		}, attrs.Service, attrs.Operation, attrs.Input)
+		if _, ok := errors.AsType[*nexus.OperationError](err); ok {
+			// Admit the command: the operation records this failure when it is invoked.
+			err = nil
+		}
 		if err != nil {
 			if handlerErr, ok := errors.AsType[*nexus.HandlerError](err); ok {
 				//nolint:exhaustive

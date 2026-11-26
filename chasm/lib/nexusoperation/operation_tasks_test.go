@@ -989,12 +989,17 @@ func TestScheduleToCloseTimeoutTaskHandler_Execute(t *testing.T) {
 }
 
 // testStartProcessor implements chasm.NexusOperationProcessor[string] for system endpoint start tests.
-type testStartProcessor struct{}
+type testStartProcessor struct {
+	err error
+}
 
 func (p *testStartProcessor) ProcessInput(
 	_ chasm.NexusOperationProcessorContext,
 	_ string,
 ) (*chasm.NexusOperationProcessorResult, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
 	return &chasm.NexusOperationProcessorResult{
 		RoutingKey: chasm.NexusOperationRoutingKeyRandom{},
 	}, nil
@@ -1239,6 +1244,31 @@ func TestInvocationTaskHandler_SystemEndpoint(t *testing.T) {
 			checkOutcome: func(t *testing.T, op *Operation) {
 				require.Equal(t, nexusoperationpb.OPERATION_STATUS_BACKING_OFF, op.Status)
 				require.Equal(t, string(nexus.HandlerErrorTypeInternal), op.LastAttemptFailure.GetNexusHandlerFailureInfo().GetType())
+			},
+		},
+		{
+			// A processor rejects invalid input with an operation error: the operation fails before any history RPC.
+			name: "chasm processor operation error",
+			setupHistoryClient: func(ctrl *gomock.Controller) *historyservicemock.MockHistoryServiceClient {
+				return historyservicemock.NewMockHistoryServiceClient(ctrl)
+			},
+			setupChasmRegistry: func() *chasm.Registry {
+				reg := chasm.NewRegistry(log.NewNoopLogger())
+				serviceProc := chasm.NewNexusServiceProcessor("service")
+				serviceProc.MustRegisterOperation("operation", chasm.NewRegisterableNexusOperationProcessor(&testStartProcessor{
+					err: &nexus.OperationError{
+						State:           nexus.OperationStateFailed,
+						Message:         "InvalidArgument: bad input",
+						OriginalFailure: &nexus.Failure{Message: "InvalidArgument: bad input"},
+					},
+				}))
+				reg.NexusEndpointProcessor.MustRegisterServiceProcessor(serviceProc)
+				return reg
+			},
+			expectedMetricOutcome: "operation-processor-failed",
+			checkOutcome: func(t *testing.T, op *Operation) {
+				require.Equal(t, nexusoperationpb.OPERATION_STATUS_FAILED, op.Status)
+				require.Equal(t, "InvalidArgument: bad input", op.LastAttemptFailure.GetMessage())
 			},
 		},
 		{
