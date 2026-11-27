@@ -736,8 +736,13 @@ func (s *mutableStateSuite) TestResultSubscriptionCallbacks_DEC8CanceledNotCopie
 		for _, transition := range []string{"continue_as_new", "retry_fail", "retry_timeout", "cron"} {
 			s.Run(modeName+"_"+transition, func() {
 				ctx := s.T().Context()
-				ms := s.setupCallbackModeMS(chasmMode, 2)
-				startEvent, wftCompleted := s.startWithCompletionCallbacks(ms, 0)
+				legacyCount := 0
+				if transition == "retry_fail" || transition == "retry_timeout" {
+					legacyCount = 1
+				}
+				maxCallbacks := 2 + legacyCount
+				ms := s.setupCallbackModeMS(chasmMode, maxCallbacks)
+				startEvent, wftCompleted := s.startWithCompletionCallbacks(ms, legacyCount)
 
 				sub1 := makeTestResultSubscriptionCallback("sub-active", tests.WorkflowID, tests.RunID)
 				sub2 := makeTestResultSubscriptionCallback("sub-canceled", tests.WorkflowID, tests.RunID)
@@ -757,17 +762,17 @@ func (s *mutableStateSuite) TestResultSubscriptionCallbacks_DEC8CanceledNotCopie
 				)
 				s.Require().NoError(err)
 
-				// Within the old run, the canceled subscription still occupies its slot (2/2 full).
+				// Within the old run, the canceled subscription still occupies its slot.
 				if chasmMode {
 					wf := s.chasmWorkflowComponent(ms)
-					s.Equal(int64(2), wf.GetCallbackMetadata().GetTotalCallbacksCount())
+					s.Equal(int64(maxCallbacks), wf.GetCallbackMetadata().GetTotalCallbacksCount())
 					err = ms.ValidateCallbackAddition(nil, chasmworkflow.CallbackAddition{
 						RequestID: "sub-extra",
 						Callbacks: []*commonpb.Callback{makeTestResultSubscriptionCallback("sub-extra", tests.WorkflowID, tests.RunID)},
 					})
 					s.Error(err)
 				} else {
-					s.Equal(2, callbacks.MachineCollection(ms.HSM()).Size())
+					s.Equal(maxCallbacks, callbacks.MachineCollection(ms.HSM()).Size())
 				}
 
 				var newRun historyi.MutableState
@@ -829,12 +834,16 @@ func (s *mutableStateSuite) TestResultSubscriptionCallbacks_DEC8CanceledNotCopie
 					s.FailNowf("unexpected transition", "%s", transition)
 				}
 
-				// On the new run, only sub-active was copied; sub-canceled was NOT copied so 1 slot is free (1/2 used).
+				// The canceled subscription frees one slot on the new run. Retry also carries the legacy callback.
+				carried, err := getCompletionCallbacksAsProtoSlice(ctx, newRun, false)
+				s.Require().NoError(err)
+				expected := append(testCompletionCallbacks(legacyCount), sub1)
+				protorequire.ProtoElementsMatch(s.T(), expected, carried)
 				if chasmMode {
 					wf, readCtx, err := newRun.ChasmWorkflowComponentReadOnly(ctx)
 					s.Require().NoError(err)
-					s.Len(wf.Callbacks, 1)
-					s.Equal(int64(1), wf.GetCallbackMetadata().GetTotalCallbacksCount())
+					s.Len(wf.Callbacks, len(expected))
+					s.Equal(int64(len(expected)), wf.GetCallbackMetadata().GetTotalCallbacksCount())
 					_, hasActive := wf.FindResultSubscription(readCtx, "sub-active")
 					s.True(hasActive)
 					_, hasCanceled := wf.FindResultSubscription(readCtx, "sub-canceled")
@@ -845,10 +854,7 @@ func (s *mutableStateSuite) TestResultSubscriptionCallbacks_DEC8CanceledNotCopie
 					}))
 				} else {
 					coll := callbacks.MachineCollection(newRun.HSM())
-					s.Equal(1, coll.Size())
-					cb, err := coll.Data(coll.List()[0].Key.ID)
-					s.Require().NoError(err)
-					s.Equal("sub-active", cb.GetCallback().GetResultSubscription().GetRequestId())
+					s.Equal(len(expected), coll.Size())
 				}
 			})
 		}
